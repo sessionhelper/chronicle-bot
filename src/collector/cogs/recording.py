@@ -189,6 +189,12 @@ class RecordingCog(commands.Cog):
             self.recorders[guild_id] = recorder
         except Exception:
             log.error("recording_start_failed", session_id=session_id, exc_info=True)
+            # Clean up voice connection
+            if recorder and recorder.voice_client:
+                try:
+                    await recorder.disconnect()
+                except Exception:
+                    pass
             self.consent_manager.remove_session(guild_id)
             self.metadata.pop(guild_id, None)
             if text_channel:
