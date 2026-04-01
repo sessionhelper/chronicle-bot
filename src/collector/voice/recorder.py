@@ -26,12 +26,18 @@ class VoiceRecorder:
 
     async def connect(self, channel: discord.VoiceChannel) -> None:
         self.voice_client = await channel.connect()
-        # Wait for the voice connection to be fully established
-        for _ in range(50):
-            if self.voice_client.is_connected():
-                break
-            await asyncio.sleep(0.1)
-        log.info("voice_connected", channel=channel.name, guild=channel.guild.name)
+        # Wait for the internal _connected event to be set
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, self.voice_client._connected.wait),
+            timeout=30,
+        )
+        log.info(
+            "voice_connected",
+            channel=channel.name,
+            guild=channel.guild.name,
+            is_connected=self.voice_client.is_connected(),
+        )
 
     def start_recording(self, members: list[discord.Member]) -> None:
         if self.voice_client is None:
