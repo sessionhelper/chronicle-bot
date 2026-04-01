@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import discord
@@ -25,7 +26,12 @@ class VoiceRecorder:
 
     async def connect(self, channel: discord.VoiceChannel) -> None:
         self.voice_client = await channel.connect()
-        await self.voice_client.wait_until_connected()
+        loop = asyncio.get_event_loop()
+        connected = await loop.run_in_executor(
+            None, lambda: self.voice_client.wait_until_connected(timeout=30)
+        )
+        if not connected:
+            raise RuntimeError("Voice connection timed out")
         log.info(
             "voice_connected",
             channel=channel.name,
