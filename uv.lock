@@ -679,8 +679,8 @@ wheels = [
 
 [[package]]
 name = "py-cord"
-version = "2.8.0rc2.dev29+ga98caa4fb"
-source = { git = "https://github.com/sessionhelper/pycord.git?rev=fix%2Fvoice-receive-packet-loss#a98caa4fbeb896d630f2c306acc0e74172d91497" }
+version = "2.8.0rc2.dev30+gb3fbbefc0"
+source = { git = "https://github.com/sessionhelper/pycord.git?rev=fix%2Fvoice-receive-packet-loss#b3fbbefc0afbcd19535143eea95e65f505d79c67" }
 dependencies = [
     { name = "aiohttp" },
     { name = "typing-extensions" },
