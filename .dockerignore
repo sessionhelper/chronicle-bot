@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+.env
+.ruff_cache
+.pytest_cache
+__pycache__
+sessions/
+tests/
+legal/
+*.md
+!pyproject.toml
