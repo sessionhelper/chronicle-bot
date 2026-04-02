@@ -1,5 +1,5 @@
 use serenity::all::*;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::consent::SessionState;
 use crate::state::AppState;
@@ -13,11 +13,10 @@ pub async fn handle_stop(
     let guild_id = command.guild_id.unwrap();
 
     // Check for active recording
-    let session = {
+    let session_id = {
         let manager = state.consent.lock().await;
         match manager.get_session(guild_id.get()) {
             Some(s) if s.state == SessionState::Recording => {
-                // Verify caller is initiator or admin
                 if s.initiator_id != command.user.id {
                     command
                         .create_response(
@@ -72,42 +71,115 @@ pub async fn handle_stop(
         }
     }
 
-    // Write bundle files
-    {
+    // Get session dir and process files
+    let (session_dir, guild_id_u64) = {
         let consent_mgr = state.consent.lock().await;
         let mut bundles = state.bundles.lock().await;
 
-        if let (Some(consent), Some(bundle)) = (
+        let (consent, bundle) = match (
             consent_mgr.get_session(guild_id.get()),
             bundles.get_mut(&guild_id.get()),
         ) {
-            bundle.ended_at = Some(chrono::Utc::now());
+            (Some(c), Some(b)) => (c, b),
+            _ => {
+                error!("no session or bundle found for finalization");
+                return Ok(());
+            }
+        };
 
-            // Rename PCM files from SSRC to pseudo ID
-            let ssrc_map = state.ssrc_maps.lock().await;
-            if let Some(map) = ssrc_map.get(&guild_id.get()) {
-                let map = map.lock().await;
-                for (ssrc, user_id) in map.iter() {
-                    let pseudo = pseudonymize(*user_id);
-                    let src = bundle.pcm_dir().join(format!("{}.pcm", ssrc));
-                    let dst = bundle.pcm_dir().join(format!("{}.pcm", pseudo));
-                    if src.exists() {
-                        let _ = std::fs::rename(&src, &dst);
-                        info!(ssrc = ssrc, pseudo = %pseudo, "track_renamed");
+        bundle.ended_at = Some(chrono::Utc::now());
+
+        // Rename PCM files from SSRC to pseudo user ID
+        let ssrc_map = state.ssrc_maps.lock().await;
+        if let Some(map) = ssrc_map.get(&guild_id.get()) {
+            let map = map.lock().await;
+            for (ssrc, user_id) in map.iter() {
+                let pseudo = pseudonymize(*user_id);
+                let src = bundle.pcm_dir().join(format!("{}.pcm", ssrc));
+                let dst = bundle.pcm_dir().join(format!("{}.pcm", pseudo));
+                if src.exists() {
+                    let _ = std::fs::rename(&src, &dst);
+                    info!(ssrc = ssrc, pseudo = %pseudo, "track_renamed");
+                }
+            }
+        }
+
+        // Convert PCM to FLAC
+        let pcm_dir = bundle.pcm_dir();
+        let audio_dir = bundle.audio_dir();
+        if let Ok(entries) = std::fs::read_dir(&pcm_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "pcm") {
+                    let stem = path.file_stem().unwrap().to_string_lossy();
+                    let flac_path = audio_dir.join(format!("{}.flac", stem));
+                    let status = std::process::Command::new("ffmpeg")
+                        .args([
+                            "-y",
+                            "-f", "s16le",
+                            "-ar", "48000",
+                            "-ac", "2",
+                            "-i", &path.to_string_lossy(),
+                            "-ac", "1",
+                            &flac_path.to_string_lossy(),
+                        ])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+
+                    match status {
+                        Ok(s) if s.success() => {
+                            let size = std::fs::metadata(&flac_path)
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            info!(flac = %flac_path.display(), size = size, "flac_converted");
+                        }
+                        _ => error!(pcm = %path.display(), "flac_conversion_failed"),
                     }
                 }
             }
+        }
 
-            // TODO: Convert PCM to FLAC, upload to S3
+        // Write metadata
+        bundle.write_meta(consent);
+        bundle.write_consent(consent);
 
-            bundle.write_meta(consent);
-            bundle.write_consent(consent);
+        info!(session_id = %session_id, "session_finalized");
 
-            info!(session_id = %session, "session_finalized");
+        (bundle.session_dir.clone(), guild_id.get())
+    };
+
+    // Upload to S3
+    command
+        .channel_id
+        .say(&ctx.http, "Uploading to storage...")
+        .await?;
+
+    match state
+        .s3
+        .upload_session(&session_dir, guild_id_u64, &session_id)
+        .await
+    {
+        Ok(count) => {
+            info!(count = count, session_id = %session_id, "upload_complete");
+            command
+                .channel_id
+                .say(
+                    &ctx.http,
+                    format!("Recording complete. {} files uploaded.", count),
+                )
+                .await?;
+        }
+        Err(e) => {
+            error!(error = %e, "upload_failed");
+            command
+                .channel_id
+                .say(&ctx.http, "Recording saved locally. Upload failed.")
+                .await?;
         }
     }
 
-    // Cleanup
+    // Cleanup state
     {
         let mut consent_mgr = state.consent.lock().await;
         consent_mgr.remove_session(guild_id.get());
@@ -116,11 +188,10 @@ pub async fn handle_stop(
         let mut bundles = state.bundles.lock().await;
         bundles.remove(&guild_id.get());
     }
-
-    command
-        .channel_id
-        .say(&ctx.http, "Recording complete.")
-        .await?;
+    {
+        let mut maps = state.ssrc_maps.lock().await;
+        maps.remove(&guild_id.get());
+    }
 
     Ok(())
 }
