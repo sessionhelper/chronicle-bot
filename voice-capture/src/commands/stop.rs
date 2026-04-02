@@ -53,7 +53,11 @@ pub async fn handle_stop(
     command
         .create_response(
             &ctx.http,
-            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
+            CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("Wrapping up...")
+                    .ephemeral(true),
+            ),
         )
         .await?;
 
