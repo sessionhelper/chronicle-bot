@@ -1,13 +1,6 @@
 .env
-__pycache__/
-*.pyc
-.ruff_cache/
-.pytest_cache/
-dist/
-*.egg-info/
+voice-capture/target/
 sessions/
-.venv/
 *.flac
 *.wav
 *.pcm
-voice-capture/target/
