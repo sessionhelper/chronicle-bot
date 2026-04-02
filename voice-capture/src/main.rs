@@ -88,6 +88,75 @@ impl EventHandler for Handler {
             _ => {}
         }
     }
+
+    async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, _new: VoiceState) {
+        // Check if bot is alone in any recording channel
+        let guild_id = match _new.guild_id {
+            Some(id) => id,
+            None => return,
+        };
+
+        let channel_id = {
+            let consent = self.state.consent.lock().await;
+            match consent.get_session(guild_id.get()) {
+                Some(s) if s.state == SessionState::Recording => ChannelId::new(s.channel_id),
+                _ => return,
+            }
+        };
+
+        // Count non-bot members in the channel
+        let guild = match ctx.cache.guild(guild_id) {
+            Some(g) => g.clone(),
+            None => return,
+        };
+
+        let humans_in_channel = guild
+            .voice_states
+            .values()
+            .filter(|vs| vs.channel_id == Some(channel_id))
+            .filter(|vs| {
+                guild
+                    .members
+                    .get(&vs.user_id)
+                    .is_none_or(|m| !m.user.bot)
+            })
+            .count();
+
+        if humans_in_channel == 0 {
+            let state = self.state.clone();
+            let ctx_clone = ctx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+                // Re-check after 30s
+                let guild = match ctx_clone.cache.guild(guild_id) {
+                    Some(g) => g.clone(),
+                    None => return,
+                };
+                let still_empty = guild
+                    .voice_states
+                    .values()
+                    .filter(|vs| vs.channel_id == Some(channel_id))
+                    .filter(|vs| {
+                        guild
+                            .members
+                            .get(&vs.user_id)
+                            .is_none_or(|m| !m.user.bot)
+                    })
+                    .count()
+                    == 0;
+
+                if still_empty {
+                    info!(guild_id = %guild_id, "auto_stop — channel empty for 30s");
+                    let manager = songbird::get(&ctx_clone).await.unwrap();
+                    let _ = manager.leave(guild_id).await;
+
+                    // Finalize
+                    commands::stop::auto_stop(&ctx_clone, guild_id.get(), &state).await;
+                }
+            });
+        }
+    }
 }
 
 async fn handle_consent_button(
@@ -100,7 +169,6 @@ async fn handle_consent_button(
 
     let scope = match component.data.custom_id.as_str() {
         "consent_accept" => ConsentScope::Full,
-        "consent_decline_audio" => ConsentScope::DeclineAudio,
         "consent_decline" => ConsentScope::Decline,
         _ => return Ok(()),
     };

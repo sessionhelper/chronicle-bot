@@ -3,13 +3,9 @@ use serenity::all::{CreateEmbed, CreateButton, ButtonStyle, CreateActionRow};
 use super::manager::{ConsentSession, ConsentScope};
 
 const CONSENT_TEXT: &str = "\
-This session will be recorded for the **TTRPG Open Dataset** project.\n\n\
-Your audio will be:\n\
-- Recorded as a separate per-speaker track\n\
-- Transcribed and reviewed for PII\n\
-- Released under **CC BY-SA 4.0**\n\n\
-You can decline without leaving the voice channel — \
-your audio simply won't be captured.";
+This session will be recorded for the **TTRPG Open Dataset** project \
+and released under **CC BY-SA 4.0**.\n\n\
+You can decline without leaving the voice channel.";
 
 pub fn build_consent_embed(session: &ConsentSession) -> CreateEmbed {
     let mut pending = Vec::new();
@@ -20,8 +16,9 @@ pub fn build_consent_embed(session: &ConsentSession) -> CreateEmbed {
         match p.scope {
             None => pending.push(p.display_name.as_str()),
             Some(ConsentScope::Full) => accepted.push(p.display_name.as_str()),
-            Some(ConsentScope::DeclineAudio) => declined.push(format!("{} (audio only)", p.display_name)),
-            Some(ConsentScope::Decline) => declined.push(p.display_name.clone()),
+            Some(ConsentScope::DeclineAudio | ConsentScope::Decline) => {
+                declined.push(p.display_name.clone())
+            }
         }
     }
 
@@ -49,9 +46,6 @@ pub fn consent_buttons() -> CreateActionRow {
         CreateButton::new("consent_accept")
             .label("Accept")
             .style(ButtonStyle::Success),
-        CreateButton::new("consent_decline_audio")
-            .label("Decline Audio")
-            .style(ButtonStyle::Secondary),
         CreateButton::new("consent_decline")
             .label("Decline")
             .style(ButtonStyle::Danger),

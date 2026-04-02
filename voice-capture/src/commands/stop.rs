@@ -207,3 +207,124 @@ pub async fn handle_stop(
 
     Ok(())
 }
+
+/// Auto-stop when channel empties. No command interaction needed.
+pub async fn auto_stop(ctx: &Context, guild_id: u64, state: &AppState) {
+    let session_id = {
+        let manager = state.consent.lock().await;
+        match manager.get_session(guild_id) {
+            Some(s) => s.session_id.clone(),
+            None => return,
+        }
+    };
+
+    {
+        let mut consent_mgr = state.consent.lock().await;
+        if let Some(s) = consent_mgr.get_session_mut(guild_id) {
+            s.state = crate::consent::SessionState::Finalizing;
+        }
+    }
+
+    let session_dir = {
+        let consent_mgr = state.consent.lock().await;
+        let mut bundles = state.bundles.lock().await;
+
+        if let (Some(consent), Some(bundle)) = (
+            consent_mgr.get_session(guild_id),
+            bundles.get_mut(&guild_id),
+        ) {
+            bundle.ended_at = Some(chrono::Utc::now());
+
+            // Rename PCM files
+            let mut renamed = false;
+            let ssrc_map = state.ssrc_maps.lock().await;
+            if let Some(map) = ssrc_map.get(&guild_id) {
+                let map = map.lock().await;
+                for (ssrc, user_id) in map.iter() {
+                    let pseudo = pseudonymize(*user_id);
+                    let src = bundle.pcm_dir().join(format!("{}.pcm", ssrc));
+                    let dst = bundle.pcm_dir().join(format!("{}.pcm", pseudo));
+                    if src.exists() {
+                        let _ = std::fs::rename(&src, &dst);
+                        renamed = true;
+                    }
+                }
+            }
+
+            if !renamed {
+                let consented = consent.consented_user_ids();
+                let mut pcm_files: Vec<_> = std::fs::read_dir(bundle.pcm_dir())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| e.path().extension().is_some_and(|x| x == "pcm"))
+                    .collect();
+                pcm_files.sort_by_key(|e| e.file_name());
+                for (file, uid) in pcm_files.iter().zip(consented.iter()) {
+                    let pseudo = pseudonymize(uid.get());
+                    let dst = bundle.pcm_dir().join(format!("{}.pcm", pseudo));
+                    let _ = std::fs::rename(file.path(), &dst);
+                }
+            }
+
+            // Convert PCM to FLAC
+            if let Ok(entries) = std::fs::read_dir(bundle.pcm_dir()) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "pcm") {
+                        let stem = path.file_stem().unwrap().to_string_lossy();
+                        let flac_path = bundle.audio_dir().join(format!("{}.flac", stem));
+                        let _ = std::process::Command::new("ffmpeg")
+                            .args([
+                                "-y", "-f", "s16le", "-ar", "48000", "-ac", "2",
+                                "-i", &path.to_string_lossy(), "-ac", "1",
+                                &flac_path.to_string_lossy(),
+                            ])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
+                }
+            }
+
+            bundle.write_meta(consent);
+            bundle.write_consent(consent);
+            info!(session_id = %session_id, "auto_session_finalized");
+            Some((bundle.session_dir.clone(), guild_id))
+        } else {
+            None
+        }
+    };
+
+    // Upload
+    if let Some((dir, gid)) = session_dir {
+        let _ = state.s3.upload_session(&dir, gid, &session_id).await;
+
+        // Notify in text channel
+        let text_channel = {
+            let consent_mgr = state.consent.lock().await;
+            consent_mgr
+                .get_session(guild_id)
+                .map(|s| ChannelId::new(s.text_channel_id))
+        };
+        if let Some(ch) = text_channel {
+            let _ = ch
+                .say(&ctx.http, "Channel empty — recording saved. Thanks!")
+                .await;
+        }
+    }
+
+    // Cleanup
+    {
+        let mut consent_mgr = state.consent.lock().await;
+        consent_mgr.remove_session(guild_id);
+    }
+    {
+        let mut bundles = state.bundles.lock().await;
+        bundles.remove(&guild_id);
+    }
+    {
+        let mut maps = state.ssrc_maps.lock().await;
+        maps.remove(&guild_id);
+    }
+}
