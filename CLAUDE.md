@@ -4,62 +4,63 @@ Discord bot for collecting TTRPG session audio for an open dataset.
 
 ## Stack
 
-- Python 3.12+, py-cord (async Discord bot with voice receive)
-- pydantic-settings for config
-- boto3/aioboto3 for S3-compatible uploads (Hetzner Object Storage)
-- structlog for logging
-- pytest for testing, ruff for linting
-- Docker for deployment, GitHub Actions for CI/CD
+- Rust (serenity + songbird)
+- songbird `next` branch for DAVE E2EE voice receive
+- aws-sdk-s3 for S3-compatible uploads (Hetzner Object Storage)
+- ffmpeg for PCM → FLAC conversion
 
 ## Layout
 
 ```
-src/collector/
-  bot.py              — Entry point, cog loading
-  config.py           — Env var config (pydantic-settings)
-  cogs/recording.py   — /record, /stop, /status slash commands
-  cogs/notes.py       — /notes modal command
-  voice/recorder.py   — Join channel, manage AudioSink
-  voice/sink.py       — Custom AudioSink writing per-user PCM to disk
-  voice/stream_manager.py — Per-user stream tracking, joins/leaves
-  consent/manager.py  — Consent state machine
-  consent/views.py    — Discord button views for consent
-  consent/types.py    — Enums
-  storage/s3_upload.py — S3-compatible upload with retry
-  storage/local_buffer.py — Temp dir management, orphan recovery
-  storage/session_bundle.py — meta.json, consent.json, pii.json assembly
-  metadata/           — Session metadata, quality filters
+voice-capture/
+  src/
+    main.rs              — entry point, serenity client, event handlers
+    config.rs            — env var config (clap)
+    state.rs             — shared app state
+    commands/
+      record.rs          — /record slash command
+      stop.rs            — /stop slash command (finalize + upload)
+    consent/
+      manager.rs         — consent state machine, quorum logic
+      embeds.rs          — Discord embed + button builders
+    voice/
+      receiver.rs        — VoiceTick handler, per-user PCM to disk, SSRC tracking
+    storage/
+      bundle.rs          — meta.json, consent.json, pseudonymization
+      s3.rs              — S3 upload with retry
+  Cargo.toml
+scripts/
+  sync-s3.sh             — download S3 data locally
+legal/                   — privacy policy, ToS, consent text, dataset card
 ```
 
-## Running locally
+## Building
 
 ```bash
-uv sync
-cp .env.example .env   # fill in DISCORD_TOKEN + S3 creds
-uv run python -m collector.bot
+cd voice-capture
+cargo build --release
 ```
 
-## Running with Docker
+Requires: cmake (for opus build), ffmpeg (runtime, for PCM→FLAC)
+
+## Running
 
 ```bash
-docker compose up -d
+cp .env.example .env  # fill in credentials
+cd voice-capture
+cargo run --release
 ```
 
-## Testing
+## Git Workflow
 
-```bash
-uv run pytest
-uv run ruff check src/ tests/
-```
-
-## Deploying
-
-Push to `main` → GitHub Actions runs tests → builds Docker image → pushes to GHCR → SSHs to VPS and restarts.
+- **main** — production, deploys to VPS on push
+- **dev** — integration branch
+- **feature/*** — branch from dev, merge back via --no-ff
 
 ## Key Decisions
 
-- py-cord voice receive uses C bindings (libopus, libsodium) under the hood
-- Raw PCM buffered to disk during recording, converted to WAV on stop
-- Consent required before any audio is captured
-- User snowflakes pseudonymized in public metadata
-- S3 storage is provider-agnostic (Hetzner, Backblaze, MinIO — any S3-compatible endpoint)
+- Full Rust — py-cord's DAVE voice receive was fundamentally broken (~10% packet capture)
+- Songbird handles DAVE/E2EE natively with near-zero packet loss
+- PCM written to disk, converted to FLAC on /stop, uploaded to S3
+- Per-user tracks via SSRC → user_id mapping from SpeakingStateUpdate events
+- Simple SHA256 hash for pseudonymization (no salt — voice is public anyway)
