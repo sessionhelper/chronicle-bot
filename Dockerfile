@@ -3,8 +3,8 @@ FROM rust:1.94-bookworm AS builder
 RUN apt-get update && apt-get install -y cmake
 
 WORKDIR /app
-COPY Cargo.toml Cargo.lock* ./
-COPY src/ src/
+COPY voice-capture/Cargo.toml voice-capture/Cargo.lock ./
+COPY voice-capture/src/ src/
 RUN cargo build --release
 
 FROM debian:bookworm-slim
