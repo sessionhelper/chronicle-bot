@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: voice-capture
+      - name: Install cmake
+        run: sudo apt-get install -y cmake
+      - name: Check
+        working-directory: voice-capture
+        run: cargo check --release
+      - name: Clippy
+        working-directory: voice-capture
+        run: cargo clippy --release -- -D warnings
