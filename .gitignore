@@ -7,3 +7,7 @@ dist/
 *.egg-info/
 sessions/
 .venv/
+*.flac
+*.wav
+*.pcm
+voice-capture/target/
