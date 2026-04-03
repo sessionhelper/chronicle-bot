@@ -18,7 +18,7 @@ Discord Voice Channel
        │  │
        │  ├──→ S3 (Hetzner Object Storage)
        │  │      metadata: meta.json, consent.json (written at start, updated at stop)
-       │  │      audio: 50MB raw PCM chunks per speaker (uploaded during recording)
+       │  │      audio: 5MB raw PCM chunks per speaker (uploaded during recording)
        │  │
        │  └──→ Postgres
        │         sessions, participants, consent state, audit log
@@ -120,7 +120,7 @@ VoiceTick events arrive (20ms frames, per-speaker decoded PCM)
   ├─ Check: is speaker in consented_users set?
   ├─ Map SSRC → user_id → pseudo_id
   ├─ Write PCM bytes to ChunkedWriter buffer
-  └─ When buffer >= 50MB:
+  └─ When buffer >= 5MB:
        ├─ Upload chunk to S3: sessions/{guild}/{session}/audio/{pseudo_id}/chunk_{seq:04}.pcm
        ├─ Increment sequence number
        └─ Clear buffer
@@ -152,7 +152,7 @@ sessions/{guild_id}/{session_id}/
   consent.json                           # Written at recording start, overwritten at stop
   audio/
     {pseudo_id_a}/
-      chunk_0000.pcm                     # 50MB raw PCM chunks
+      chunk_0000.pcm                     # 5MB raw PCM chunks
       chunk_0001.pcm                     # ~4.4 minutes each at 48kHz stereo s16le
       chunk_0002.pcm
     {pseudo_id_b}/

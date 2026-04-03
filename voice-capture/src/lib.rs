@@ -1,4 +1,7 @@
+//! Shared library crate for the TTRPG collector bot.
+//!
+//! Re-exports modules used by both the binary and tests.
+
 pub mod config;
-pub mod consent;
 pub mod db;
 pub mod storage;

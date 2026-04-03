@@ -1,3 +1,9 @@
+//! Audio capture pipeline: VoiceTick handler, per-speaker buffering, and S3 upload.
+//!
+//! The hot path (VoiceTick) is kept lock-free by sending audio packets through
+//! an mpsc channel to a background buffer task. The buffer task accumulates
+//! per-speaker PCM data and uploads chunks to S3 when they reach the threshold.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -21,7 +27,7 @@ pub struct AudioPacket {
     data: Vec<i16>,
 }
 
-/// Per-speaker buffer that uploads 50MB chunks to S3 when full.
+/// Per-speaker buffer that uploads 5MB chunks to S3 when full.
 struct SpeakerBuffer {
     pseudo_id: String,
     buffer: Vec<u8>,
@@ -73,6 +79,7 @@ impl SpeakerBuffer {
     }
 }
 
+/// A buffered PCM chunk ready for S3 upload.
 struct ChunkToUpload {
     pseudo_id: String,
     seq: u32,
@@ -176,6 +183,8 @@ impl VoiceEventHandler for AudioReceiver {
                     self.audio_received
                         .store(true, std::sync::atomic::Ordering::Relaxed);
 
+                    metrics::counter!("ttrpg_audio_packets_received").increment(1);
+
                     // Send to buffer task via channel — no lock contention
                     let _ = self.tx.try_send(AudioPacket {
                         ssrc: *ssrc,
@@ -190,7 +199,7 @@ impl VoiceEventHandler for AudioReceiver {
 }
 
 /// Background task that receives audio from the channel, buffers per-speaker,
-/// and uploads 50MB chunks to S3. Exits when signaled via close_signal.
+/// and uploads 5MB chunks to S3. Exits when signaled via close_signal.
 async fn buffer_task(
     mut rx: mpsc::Receiver<AudioPacket>,
     s3: Arc<S3Uploader>,
@@ -216,6 +225,7 @@ async fn buffer_task(
                 // Log status every 10 seconds
                 if last_status.elapsed() >= std::time::Duration::from_secs(10) {
                     let buffered: u64 = buffers.values().map(|b| b.buffer.len() as u64).sum();
+                    metrics::gauge!("ttrpg_audio_bytes_buffered").set(buffered as f64);
                     info!(
                         packets = packet_count,
                         total_bytes = total_bytes,
@@ -238,14 +248,25 @@ async fn buffer_task(
     }
 
     // Flush all remaining speaker buffers to S3
+    metrics::gauge!("ttrpg_audio_bytes_buffered").set(0.0);
     info!(speakers = buffers.len(), "flushing_audio_buffers");
     for (ssrc, buffer) in buffers.iter_mut() {
         if let Some(chunk) = buffer.flush() {
             let key = format!("{}/{}/chunk_{:04}.pcm", s3_prefix, chunk.pseudo_id, chunk.seq);
             let size = chunk.data.len();
+            let upload_start = std::time::Instant::now();
             match s3.upload_bytes(&key, chunk.data).await {
-                Ok(_) => info!(key = %key, size = size, ssrc = ssrc, "final_chunk_uploaded"),
-                Err(e) => tracing::error!(key = %key, error = %e, "final_chunk_upload_failed"),
+                Ok(_) => {
+                    let elapsed = upload_start.elapsed().as_secs_f64();
+                    metrics::histogram!("ttrpg_audio_chunk_upload_seconds").record(elapsed);
+                    metrics::counter!("ttrpg_audio_chunks_uploaded").increment(1);
+                    metrics::counter!("ttrpg_s3_uploads_total", "type" => "chunk", "outcome" => "success").increment(1);
+                    info!(key = %key, size = size, ssrc = ssrc, upload_secs = elapsed, "final_chunk_uploaded");
+                }
+                Err(e) => {
+                    metrics::counter!("ttrpg_s3_uploads_total", "type" => "chunk", "outcome" => "failure").increment(1);
+                    tracing::error!(key = %key, error = %e, "final_chunk_upload_failed");
+                }
             }
         }
     }
@@ -273,9 +294,19 @@ fn process_packet(
         let size = chunk.data.len();
         let s3_clone = s3.clone();
         tokio::spawn(async move {
+            let upload_start = std::time::Instant::now();
             match s3_clone.upload_bytes(&key, chunk.data).await {
-                Ok(_) => info!(key = %key, size = size, "chunk_uploaded"),
-                Err(e) => tracing::error!(key = %key, error = %e, "chunk_upload_failed"),
+                Ok(_) => {
+                    let elapsed = upload_start.elapsed().as_secs_f64();
+                    metrics::histogram!("ttrpg_audio_chunk_upload_seconds").record(elapsed);
+                    metrics::counter!("ttrpg_audio_chunks_uploaded").increment(1);
+                    metrics::counter!("ttrpg_s3_uploads_total", "type" => "chunk", "outcome" => "success").increment(1);
+                    info!(key = %key, size = size, upload_secs = elapsed, "chunk_uploaded");
+                }
+                Err(e) => {
+                    metrics::counter!("ttrpg_s3_uploads_total", "type" => "chunk", "outcome" => "failure").increment(1);
+                    tracing::error!(key = %key, error = %e, "chunk_upload_failed");
+                }
             }
         });
     }
@@ -289,14 +320,14 @@ struct SpeakingTracker {
 #[async_trait]
 impl VoiceEventHandler for SpeakingTracker {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::SpeakingStateUpdate(speaking) = ctx {
-            if let Some(uid) = speaking.user_id {
-                let mut map = self.ssrc_to_user.lock().await;
-                if !map.contains_key(&speaking.ssrc) {
-                    info!(ssrc = speaking.ssrc, user_id = %uid, "ssrc_mapped");
-                }
-                map.insert(speaking.ssrc, uid.0);
+        if let EventContext::SpeakingStateUpdate(speaking) = ctx
+            && let Some(uid) = speaking.user_id
+        {
+            let mut map = self.ssrc_to_user.lock().await;
+            if !map.contains_key(&speaking.ssrc) {
+                info!(ssrc = speaking.ssrc, user_id = %uid, "ssrc_mapped");
             }
+            map.insert(speaking.ssrc, uid.0);
         }
         None
     }

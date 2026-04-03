@@ -1,5 +1,8 @@
+//! CLI / environment variable configuration via clap.
+
 use clap::Parser;
 
+/// Bot configuration, populated from CLI args or environment variables.
 #[derive(Parser, Clone)]
 #[command(name = "ttrpg-collector", about = "TTRPG session audio collector bot")]
 pub struct Config {
@@ -35,8 +38,8 @@ pub struct Config {
     #[arg(long, env = "REQUIRE_ALL_CONSENT", default_value = "true")]
     pub require_all_consent: bool,
 
-    /// S3 chunk size in bytes before flushing (default 50MB)
-    #[arg(long, env = "S3_CHUNK_SIZE", default_value = "52428800")]
+    /// S3 chunk size in bytes before flushing (default 5MB)
+    #[arg(long, env = "S3_CHUNK_SIZE", default_value = "5242880")]
     pub s3_chunk_size: usize,
 
     /// Postgres database URL
