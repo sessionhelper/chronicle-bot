@@ -27,7 +27,7 @@ pub struct AudioPacket {
     data: Vec<i16>,
 }
 
-/// Per-speaker buffer that uploads 50MB chunks to S3 when full.
+/// Per-speaker buffer that uploads 5MB chunks to S3 when full.
 struct SpeakerBuffer {
     pseudo_id: String,
     buffer: Vec<u8>,
@@ -197,7 +197,7 @@ impl VoiceEventHandler for AudioReceiver {
 }
 
 /// Background task that receives audio from the channel, buffers per-speaker,
-/// and uploads 50MB chunks to S3. Exits when signaled via close_signal.
+/// and uploads 5MB chunks to S3. Exits when signaled via close_signal.
 async fn buffer_task(
     mut rx: mpsc::Receiver<AudioPacket>,
     s3: Arc<S3Uploader>,
