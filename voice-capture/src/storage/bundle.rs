@@ -9,20 +9,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// What a participant chose when presented with the consent prompt.
-/// Defined here (in the lib crate) so both the binary's session module
-/// and the storage serialization structs can use it without circular deps.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConsentScope {
-    /// Participant consented to full audio capture and release.
-    Full,
-    /// Reserved for future use: participant declined audio but allowed metadata.
-    #[allow(dead_code)]
-    DeclineAudio,
-    /// Participant declined all recording.
-    Decline,
-}
+// ConsentScope lives in the session module — it is session-domain data.
+// Re-imported here for the serialization structs below.
+use crate::session::ConsentScope;
 
 /// Derive a pseudonymous identifier from a Discord user ID.
 /// Uses SHA-256 truncated to 16 hex chars (8 bytes) for privacy.
@@ -88,3 +77,34 @@ pub struct ConsentEntry {
 
 // SessionBundle has been replaced by Session::meta_json() and Session::consent_json().
 // The serialization structs above are still used by Session.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pseudonymize_is_deterministic() {
+        assert_eq!(pseudonymize(12345), pseudonymize(12345));
+    }
+
+    #[test]
+    fn pseudonymize_differs_between_users() {
+        assert_ne!(pseudonymize(12345), pseudonymize(12346));
+    }
+
+    #[test]
+    fn pseudonymize_is_16_hex_chars() {
+        let p = pseudonymize(999);
+        assert_eq!(p.len(), 16);
+        assert!(p.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn pseudonymize_matches_sha256_first_8_bytes() {
+        // Known vector: SHA-256 of "308408759909351425" (the alex dev user
+        // id used in infra/collector.md testing), first 8 bytes hex = the
+        // pseudo_id observed in the e2e logs.
+        let p = pseudonymize(308408759909351425);
+        assert_eq!(p, "2f09cc7c1965a203");
+    }
+}

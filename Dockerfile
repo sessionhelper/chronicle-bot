@@ -5,7 +5,6 @@ RUN apt-get update && apt-get install -y cmake
 WORKDIR /app
 COPY voice-capture/Cargo.toml voice-capture/Cargo.lock ./
 COPY voice-capture/src/ src/
-COPY voice-capture/migrations/ migrations/
 RUN cargo build --release
 
 FROM debian:bookworm-slim

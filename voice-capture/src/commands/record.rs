@@ -3,15 +3,22 @@
 use serenity::all::*;
 use tracing::error;
 
-use crate::db;
 use crate::session::{consent_buttons, Session};
 use crate::state::AppState;
 
 /// Handle the /record slash command.
-/// Creates a new Session in AwaitingConsent phase, adds all voice channel
-/// participants, and sends the consent embed. The session is only stored
-/// after Discord accepts the response — if the Discord call fails, no
-/// orphaned state is left behind.
+///
+/// Flow (structured to avoid the TOCTOU race between active-session check
+/// and session insert):
+///   1. Cheap in-process validation — voice channel, min participants
+///   2. Build the Session struct (no network calls)
+///   3. Atomically reserve the guild's slot via SessionManager::try_insert;
+///      if a session already exists, reply and bail
+///   4. Defer the interaction — now we have 15 minutes for the slow work
+///   5. Persist to Data API (create_session, add_participant per member)
+///   6. Edit the deferred response with the consent embed
+///   7. If step 5 or 6 fails, roll back by removing the session from the
+///      manager and best-effort marking the Data API row abandoned
 #[tracing::instrument(skip(ctx, command, state), fields(guild_id = %command.guild_id.unwrap()))]
 pub async fn handle_record(
     ctx: &Context,
@@ -20,25 +27,7 @@ pub async fn handle_record(
 ) -> Result<(), serenity::Error> {
     let guild_id = command.guild_id.unwrap();
 
-    // Reject if there's already an active session for this guild
-    {
-        let sessions = state.sessions.lock().await;
-        if sessions.has_active(guild_id.get()) {
-            command
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("A recording session is already active in this server.")
-                            .ephemeral(true),
-                    ),
-                )
-                .await?;
-            return Ok(());
-        }
-    }
-
-    // Find the user's voice channel
+    // Find the user's voice channel (cache lookup, instant)
     let guild = ctx.cache.guild(guild_id).unwrap().clone();
     let channel_id = guild
         .voice_states
@@ -62,7 +51,7 @@ pub async fn handle_record(
         }
     };
 
-    // Gather non-bot members in the voice channel
+    // Gather non-bot members in the voice channel (cache, instant)
     let members: Vec<(UserId, String)> = guild
         .voice_states
         .iter()
@@ -93,7 +82,7 @@ pub async fn handle_record(
         return Ok(());
     }
 
-    // Create the unified session — all state lives here
+    // Build the session locally (no network calls in the constructor)
     let mut session = Session::new(
         guild_id.get(),
         channel_id.get(),
@@ -102,51 +91,149 @@ pub async fn handle_record(
         state.config.min_participants,
         state.config.require_all_consent,
     );
-
     for (uid, name) in &members {
         session.add_participant(*uid, name.clone(), false);
     }
+    let session_id = session.id.clone();
 
-    // Persist session and participants to Postgres (non-blocking, best-effort)
-    if let Ok(session_uuid) = uuid::Uuid::parse_str(&session.id) {
-        let new_session = db::NewSession {
-            id: session_uuid,
-            guild_id: guild_id.get() as i64,
-            started_at: chrono::Utc::now(),
-            game_system: None,
-            campaign_name: None,
-        };
+    // Atomically reserve the guild's slot. If another /record is in flight
+    // for this guild, bail instantly — no Data API rows created, no Discord
+    // side-effects, no lock held across await points.
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Err(_rejected) = sessions.try_insert(session) {
+            drop(sessions);
+            command
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("A recording session is already active in this server.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await?;
+            return Ok(());
+        }
+    }
 
-        if let Err(e) = db::create_session(&state.db, &new_session).await {
-            error!("DB write failed (create_session): {e}");
+    // Slot reserved. Defer the Discord interaction so the slow work below
+    // can run without fighting the 3-second response window.
+    command
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new()),
+        )
+        .await?;
+
+    // Persist session and participants to Data API. Track the first hard
+    // failure so we can roll back cleanly — individual add_participant
+    // failures are logged but not treated as fatal.
+    let session_uuid = uuid::Uuid::parse_str(&session_id).ok();
+    let mut create_failed = false;
+    if let Some(sid) = session_uuid {
+        let s3_prefix = format!("sessions/{}/{}", guild_id.get(), session_id);
+        if let Err(e) = state
+            .api
+            .create_session(
+                sid,
+                guild_id.get() as i64,
+                chrono::Utc::now(),
+                None,
+                None,
+                Some(s3_prefix),
+            )
+            .await
+        {
+            error!("API call failed (create_session): {e}");
+            create_failed = true;
         }
 
-        // Add each participant, checking blocklist first
-        for (uid, _name) in &members {
-            match db::check_blocklist(&state.db, uid.get()).await {
-                Ok(true) => {
-                    tracing::info!(user_id = %uid, "participant_blocked — user opted out globally, skipping");
-                    continue;
+        if !create_failed {
+            // Blocklist check per user first. Users who've opted out
+            // globally are dropped from the batch before it's sent.
+            let mut accepted: Vec<(UserId, u64)> = Vec::with_capacity(members.len());
+            for (uid, _name) in &members {
+                match state.api.check_blocklist(uid.get()).await {
+                    Ok(true) => {
+                        tracing::info!(
+                            user_id = %uid,
+                            "participant_blocked — user opted out globally, skipping"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("API call failed (check_blocklist): {e}");
+                    }
+                    _ => {}
                 }
-                Err(e) => {
-                    error!("DB read failed (check_blocklist): {e}");
-                }
-                _ => {}
+                accepted.push((*uid, uid.get()));
             }
 
-            let participant = db::NewParticipant {
-                session_id: session_uuid,
-                discord_user_id: uid.get(),
-                mid_session_join: false,
-            };
-            if let Err(e) = db::add_participant(&state.db, &participant).await {
-                error!("DB write failed (add_participant): {e}");
+            // Single batch insert + single response → one HTTP round trip
+            // regardless of party size. Cache each returned UUID on the
+            // local Session so consent/license clicks hit the fast path.
+            let batch_input: Vec<(u64, bool)> = accepted
+                .iter()
+                .map(|(_, raw)| (*raw, false))
+                .collect();
+            match state.api.add_participants_batch(sid, &batch_input).await {
+                Ok(rows) => {
+                    let count = rows.len();
+                    let mut sessions = state.sessions.lock().await;
+                    if let Some(s) = sessions.get_mut(guild_id.get()) {
+                        for ((user_id, _), row) in accepted.iter().zip(rows.iter()) {
+                            s.set_participant_uuid(*user_id, row.id);
+                        }
+                    }
+                    tracing::info!(
+                        participants = count,
+                        "participants_batched_and_cached",
+                    );
+                }
+                Err(e) => {
+                    error!("API call failed (add_participants_batch): {e}");
+                }
             }
         }
     }
 
-    let embed = session.consent_embed();
-    let buttons = consent_buttons();
+    // If the Data API session row couldn't be created, roll back the local
+    // reservation so a retry isn't blocked by a zombie entry.
+    if create_failed {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(guild_id.get());
+        drop(sessions);
+        let _ = command
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new()
+                    .content("Couldn't reach the storage backend. Try `/record` again in a moment."),
+            )
+            .await;
+        return Ok(());
+    }
+
+    // Build the consent embed now that the reserved session has participants.
+    // Re-borrow the reserved session to read the embed state.
+    let (embed, buttons) = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(guild_id.get()) {
+            Some(s) => (s.consent_embed(), consent_buttons()),
+            None => {
+                // The session was removed between reservation and here —
+                // e.g. by /stop or auto_stop. Nothing more to do.
+                let _ = command
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content("Session was cancelled. Try `/record` again."),
+                    )
+                    .await;
+                return Ok(());
+            }
+        }
+    };
 
     let mentions: String = members
         .iter()
@@ -154,32 +241,36 @@ pub async fn handle_record(
         .collect::<Vec<_>>()
         .join(" ");
 
-    // Respond to Discord FIRST — if this fails, don't store the session
-    let response_result = command
-        .create_response(
+    // Fill in the deferred response with the consent embed. On failure,
+    // roll back the reservation and (best-effort) mark the Data API session
+    // abandoned so we don't leak a row.
+    match command
+        .edit_response(
             &ctx.http,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(mentions)
-                    .embed(embed)
-                    .components(vec![buttons]),
-            ),
+            EditInteractionResponse::new()
+                .content(mentions)
+                .embed(embed)
+                .components(vec![buttons]),
         )
-        .await;
-
-    match response_result {
-        Ok(_) => {
+        .await
+    {
+        Ok(msg) => {
             metrics::counter!("ttrpg_sessions_total", "outcome" => "started").increment(1);
-            // Store the consent message ID so we can clean it up on session end
-            if let Ok(msg) = command.get_response(&ctx.http).await {
-                session.consent_message = Some((msg.channel_id, msg.id));
-            }
-            // Only store the session after Discord accepted the response
             let mut sessions = state.sessions.lock().await;
-            sessions.insert(session);
+            if let Some(s) = sessions.get_mut(guild_id.get()) {
+                s.consent_message = Some((msg.channel_id, msg.id));
+            }
         }
         Err(e) => {
-            // No cleanup needed — session was never stored
+            error!(error = %e, "edit_response_failed — rolling back reservation");
+            let mut sessions = state.sessions.lock().await;
+            sessions.remove(guild_id.get());
+            drop(sessions);
+            if let Some(sid) = session_uuid
+                && let Err(api_e) = state.api.abandon_session(sid).await
+            {
+                error!("API call failed (abandon_session): {api_e}");
+            }
             return Err(e);
         }
     }

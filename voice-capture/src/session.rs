@@ -4,24 +4,35 @@
 //! enforced via enum variants. No more scattered HashMaps in AppState.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serenity::all::{ChannelId, MessageId, UserId};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 use serenity::all::{CreateEmbed, CreateButton, ButtonStyle, CreateActionRow};
 
+use crate::api_client::DataApiClient;
 use crate::voice::{AudioHandle, AudioPacket, AudioReceiver};
-use crate::storage::S3Uploader;
 use crate::storage::pseudonymize;
 use crate::storage::bundle::{
     SessionMeta, AudioFormat, ParticipantMeta, ConsentRecord, ConsentEntry,
 };
 
-// Re-export ConsentScope so callers can use session::ConsentScope
-pub use crate::storage::bundle::ConsentScope;
+/// What a participant chose when presented with the consent prompt.
+/// This is session-domain data; the serde derive is here so it can be
+/// embedded directly in the JSON payloads that ship to S3 via meta.json
+/// and consent.json.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentScope {
+    /// Participant consented to full audio capture and release.
+    Full,
+    /// Participant declined all recording.
+    Decline,
+}
 
 /// Per-participant consent record, tracking who they are and what they chose.
 #[derive(Debug, Clone)]
@@ -31,26 +42,99 @@ pub struct ParticipantConsent {
     pub scope: Option<ConsentScope>,
     pub consented_at: Option<DateTime<Utc>>,
     pub mid_session_join: bool,
+    /// Cached Data API participant row UUID, populated at add_participant
+    /// time from the server's response. When present, consent / license
+    /// click handlers can call the _by_id fast path (1 HTTP round trip)
+    /// instead of the 3-hop find_participant fallback
+    /// (upsert user + list participants + filter by user_id).
+    pub participant_uuid: Option<uuid::Uuid>,
+    /// Local mirror of the Data API license flags, updated from batch-add
+    /// responses and license-toggle PATCH responses. Lets license button
+    /// clicks compute the toggle + patch in a single round trip without
+    /// a read-back.
+    pub no_llm_training: bool,
+    pub no_public_release: bool,
 }
 
-/// All possible session states. Each variant carries only the data relevant to that phase.
+/// Fields owned by both `StartingRecording` and `Recording` phases. The audio
+/// pipeline is created at the StartingRecording transition and kept alive
+/// through to Finalizing — splitting these fields into their own struct lets
+/// both variants share the exact same shape without code duplication.
+pub struct RecordingPipeline {
+    pub audio_tx: mpsc::Sender<AudioPacket>,
+    pub audio_handle: AudioHandle,
+    pub ssrc_map: Arc<StdMutex<HashMap<u32, u64>>>,
+    pub consented_users: Arc<Mutex<HashSet<u64>>>,
+}
+
+/// Full session lifecycle.
+///
+/// ```text
+///   AwaitingConsent
+///     │
+///     │ (quorum met, begin_startup)
+///     ▼
+///   StartingRecording ─────────────────┐ (/stop or DAVE failed)
+///     │                                │
+///     │ (DAVE audio confirmed,         ▼
+///     │  confirm_recording)         Cancelled ──▶ removed
+///     ▼
+///   Recording
+///     │
+///     │ (/stop or auto_stop, finalize)
+///     ▼
+///   Finalizing
+///     │
+///     │ (metadata uploaded, complete)
+///     ▼
+///   Complete ──▶ removed
+/// ```
+///
+/// The key property: a phase transition IS the cancellation mechanism. If
+/// /stop fires during StartingRecording, the startup pipeline sees the phase
+/// change on its next lock acquisition and bails cleanly. No separate flag,
+/// no polling of an AtomicBool, no unwrap() panics when concurrent cleanup
+/// removes the session out from under a running task.
 pub enum Phase {
     /// Waiting for all participants to accept/decline.
     AwaitingConsent,
 
-    /// Bot is in voice, actively capturing audio.
-    Recording {
-        audio_tx: mpsc::Sender<AudioPacket>,
-        audio_handle: AudioHandle,
-        ssrc_map: Arc<Mutex<HashMap<u32, u64>>>,
-        consented_users: Arc<Mutex<HashSet<u64>>>,
-    },
+    /// Quorum met. Voice channel joined, audio pipeline created, DAVE
+    /// handshake in progress. Carries the pipeline even though no audio is
+    /// flowing yet — the `audio_received` flag flips to true inside VoiceTick
+    /// when DAVE starts delivering decoded frames.
+    StartingRecording(RecordingPipeline),
 
-    /// /stop called, flushing buffers and uploading metadata.
+    /// DAVE confirmed. Audio flowing, chunks uploading.
+    Recording(RecordingPipeline),
+
+    /// /stop or auto_stop fired during Recording. Metadata is uploading.
     Finalizing,
 
-    /// Session complete — kept briefly for cleanup, then removed.
+    /// /stop fired during StartingRecording, or DAVE gave up after retries.
+    /// No metadata to upload; Data API row marked `abandoned`.
+    Cancelled,
+
+    /// Terminal state. Session about to be removed from the manager.
     Complete,
+}
+
+impl Phase {
+    /// True if /stop can act on this phase (i.e. a session visibly exists
+    /// from the user's perspective).
+    pub fn is_stoppable(&self) -> bool {
+        matches!(
+            self,
+            Self::AwaitingConsent | Self::StartingRecording(_) | Self::Recording(_)
+        )
+    }
+
+    /// True if this phase means the session is on its way out — no further
+    /// state mutation should happen except the final remove. Used by
+    /// `pipeline_aborted` to detect concurrent /stop preemption.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Finalizing | Self::Cancelled | Self::Complete)
+    }
 }
 
 /// A single recording session. One per guild, owns all session state.
@@ -77,9 +161,13 @@ pub struct Session {
     pub license_followups: Vec<(String, MessageId)>,
     pub license_cleanup_tasks: Vec<JoinHandle<()>>,
 
+    /// Pending auto-stop timer task, if any. Set when the voice channel
+    /// becomes empty; aborted on rejoin (rapid leave/rejoin churn) or on
+    /// finalization. At most one pending timer per session at a time.
+    pub auto_stop_task: Option<JoinHandle<()>>,
+
     // Audio config
     pub audio_received: Arc<std::sync::atomic::AtomicBool>,
-    pub s3_prefix: String,
 }
 
 impl Session {
@@ -93,7 +181,6 @@ impl Session {
         require_all: bool,
     ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
-        let s3_prefix = format!("sessions/{}/{}/audio", guild_id, id);
         Self {
             id,
             guild_id,
@@ -109,8 +196,16 @@ impl Session {
             consent_message: None,
             license_followups: Vec::new(),
             license_cleanup_tasks: Vec::new(),
+            auto_stop_task: None,
             audio_received: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            s3_prefix,
+        }
+    }
+
+    /// Abort a pending auto-stop timer if any. Called when the channel
+    /// re-fills (rapid leave/rejoin) and during finalization.
+    pub fn abort_auto_stop(&mut self) {
+        if let Some(h) = self.auto_stop_task.take() {
+            h.abort();
         }
     }
 
@@ -124,7 +219,35 @@ impl Session {
             scope: None,
             consented_at: None,
             mid_session_join: mid_session,
+            participant_uuid: None,
+            no_llm_training: false,
+            no_public_release: false,
         });
+    }
+
+    /// Update the cached license flags for a participant from a Data API
+    /// PATCH response. Called after each license toggle so the next toggle
+    /// can be computed locally without a read-back.
+    pub fn set_license_flags(
+        &mut self,
+        user_id: UserId,
+        no_llm_training: bool,
+        no_public_release: bool,
+    ) {
+        if let Some(p) = self.participants.get_mut(&user_id) {
+            p.no_llm_training = no_llm_training;
+            p.no_public_release = no_public_release;
+        }
+    }
+
+    /// Current cached license flags for a participant, or (false, false)
+    /// as the default. Used by the license button click handler to pass
+    /// "current" flags into toggle_license_flag_by_id.
+    pub fn license_flags(&self, user_id: UserId) -> (bool, bool) {
+        self.participants
+            .get(&user_id)
+            .map(|p| (p.no_llm_training, p.no_public_release))
+            .unwrap_or((false, false))
     }
 
     /// Record a participant's consent choice.
@@ -133,6 +256,26 @@ impl Session {
             p.scope = Some(scope);
             p.consented_at = Some(Utc::now());
         }
+    }
+
+    /// Cache the Data API's participant row UUID for a local user. Called
+    /// after `add_participants_batch` returns so subsequent consent/license
+    /// clicks can skip the find_participant lookup.
+    ///
+    /// Idempotent: if the user already has a uuid, it's overwritten. If the
+    /// user isn't in the participants map, this is a no-op (mirrors
+    /// record_consent's tolerance for stale clicks).
+    pub fn set_participant_uuid(&mut self, user_id: UserId, participant_uuid: uuid::Uuid) {
+        if let Some(p) = self.participants.get_mut(&user_id) {
+            p.participant_uuid = Some(participant_uuid);
+        }
+    }
+
+    /// Look up the cached Data API participant UUID for a local user.
+    /// Returns None if the user isn't in the participants map OR if the
+    /// cache hasn't been populated yet (e.g. bot restarted mid-session).
+    pub fn participant_uuid(&self, user_id: UserId) -> Option<uuid::Uuid> {
+        self.participants.get(&user_id).and_then(|p| p.participant_uuid)
     }
 
     /// True if every participant has responded (accepted or declined).
@@ -164,79 +307,125 @@ impl Session {
 
     // --- Phase transitions ---
 
-    /// Transition from AwaitingConsent -> Recording.
-    /// Creates the audio pipeline and returns the channel sender for DAVE retries.
+    /// AwaitingConsent → StartingRecording. Creates the audio pipeline and
+    /// joins the Songbird call, but leaves the session in the transient
+    /// "starting" phase until DAVE delivers decoded audio. Returns the audio
+    /// channel sender for DAVE retry reattachment.
     #[tracing::instrument(skip_all, fields(session_id = %self.id, guild_id = self.guild_id))]
-    pub fn start_recording(
+    pub fn begin_startup(
         &mut self,
         call: &mut songbird::Call,
-        s3: Arc<S3Uploader>,
+        api: Arc<DataApiClient>,
     ) -> mpsc::Sender<AudioPacket> {
-        let consented_set: HashSet<u64> = self.consented_user_ids()
+        let consented_set: HashSet<u64> = self
+            .consented_user_ids()
             .into_iter()
             .map(|uid| uid.get())
             .collect();
         let consented_users = Arc::new(Mutex::new(consented_set));
 
-        // Create pipeline once — single buffer task for the session
-        let (audio_tx, audio_handle) = AudioReceiver::create_pipeline(
-            s3, self.s3_prefix.clone(),
-        );
+        let session_uuid =
+            uuid::Uuid::parse_str(&self.id).expect("session id is always a valid UUID");
 
-        // Attach to the Songbird Call
+        let (audio_tx, audio_handle) = AudioReceiver::create_pipeline(api, session_uuid);
         let ssrc_map = AudioReceiver::attach(
-            call, audio_tx.clone(), consented_users.clone(), self.audio_received.clone(),
+            call,
+            audio_tx.clone(),
+            consented_users.clone(),
+            self.audio_received.clone(),
         );
 
-        self.phase = Phase::Recording {
+        self.phase = Phase::StartingRecording(RecordingPipeline {
             audio_tx: audio_tx.clone(),
             audio_handle,
             ssrc_map,
             consented_users,
-        };
+        });
 
         audio_tx
     }
 
-    /// Re-attach audio receiver after a DAVE retry (new Songbird Call).
-    /// Reuses the existing pipeline — same channel, same buffer task.
+    /// StartingRecording → Recording, once DAVE has delivered decoded audio.
+    /// Idempotent: if called while already in Recording (e.g. after a retry
+    /// path), does nothing. If called in any other phase, does nothing —
+    /// the session was preempted between the audio-detected check and here.
+    pub fn confirm_recording(&mut self) {
+        let placeholder = Phase::AwaitingConsent;
+        let current = std::mem::replace(&mut self.phase, placeholder);
+        self.phase = match current {
+            Phase::StartingRecording(data) => Phase::Recording(data),
+            other => other,
+        };
+    }
+
+    /// Re-attach the audio receiver to a new Songbird Call after a DAVE
+    /// retry (leave + rejoin). Reuses the existing pipeline — same channel,
+    /// same buffer task. Only valid during StartingRecording; silently
+    /// ignored in other phases.
     pub fn reattach_audio(&mut self, call: &mut songbird::Call) {
-        if let Phase::Recording { audio_tx, consented_users, ssrc_map, .. } = &mut self.phase {
+        if let Phase::StartingRecording(data) = &mut self.phase {
             let new_ssrc_map = AudioReceiver::attach(
-                call, audio_tx.clone(), consented_users.clone(), self.audio_received.clone(),
+                call,
+                data.audio_tx.clone(),
+                data.consented_users.clone(),
+                self.audio_received.clone(),
             );
-            *ssrc_map = new_ssrc_map;
+            data.ssrc_map = new_ssrc_map;
         }
     }
 
-    /// Check if DAVE is delivering audio.
+    /// Check if DAVE is delivering audio. Returns the underlying atomic flag
+    /// that VoiceTick flips to true on the first decoded packet.
     pub fn has_audio(&self) -> bool {
-        self.audio_received.load(std::sync::atomic::Ordering::Relaxed)
+        self.audio_received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Check if any SSRC has been mapped (DAVE connection alive, even if silent).
-    pub async fn has_ssrc(&self) -> bool {
-        if let Phase::Recording { ssrc_map, .. } = &self.phase {
-            let map = ssrc_map.lock().await;
-            !map.is_empty()
-        } else {
-            false
+    /// Check if any SSRC has been mapped (DAVE connection alive, even if
+    /// silent). Valid during StartingRecording and Recording.
+    pub fn has_ssrc(&self) -> bool {
+        match &self.phase {
+            Phase::StartingRecording(data) | Phase::Recording(data) => {
+                let map = data.ssrc_map.lock().expect("ssrc_map poisoned");
+                !map.is_empty()
+            }
+            _ => false,
         }
     }
 
-    /// Transition from Recording -> Finalizing. Shuts down audio pipeline.
+    /// Recording → Finalizing. Shuts down the audio pipeline and marks the
+    /// session as ended. Called by /stop and auto_stop on the happy path.
+    ///
+    /// If called in StartingRecording (e.g. /stop fires before DAVE confirmed)
+    /// this still shuts the pipeline down but the caller should treat the
+    /// session as cancelled, not finalized — prefer `cancel_startup` in that
+    /// case so metadata upload is skipped.
     #[tracing::instrument(skip_all, fields(session_id = %self.id))]
     pub async fn finalize(&mut self) {
         self.ended_at = Some(Utc::now());
-
-        // Take the audio handle out of the phase and shut it down
         let old_phase = std::mem::replace(&mut self.phase, Phase::Finalizing);
-        if let Phase::Recording { audio_handle, .. } = old_phase {
-            audio_handle.shutdown().await;
+        match old_phase {
+            Phase::Recording(data) | Phase::StartingRecording(data) => {
+                data.audio_handle.shutdown().await;
+            }
+            _ => {}
         }
     }
 
-    /// Mark session as complete.
+    /// StartingRecording → Cancelled. Called when /stop fires before DAVE
+    /// confirms, or when DAVE gives up after retries. Shuts the pipeline
+    /// down but the caller skips metadata upload — there is nothing to
+    /// upload.
+    #[tracing::instrument(skip_all, fields(session_id = %self.id))]
+    pub async fn cancel_startup(&mut self) {
+        self.ended_at = Some(Utc::now());
+        let old_phase = std::mem::replace(&mut self.phase, Phase::Cancelled);
+        if let Phase::StartingRecording(data) = old_phase {
+            data.audio_handle.shutdown().await;
+        }
+    }
+
+    /// Finalizing → Complete. Last step before the session is removed.
     pub fn complete(&mut self) {
         self.phase = Phase::Complete;
     }
@@ -250,15 +439,14 @@ impl Session {
         }
     }
 
-    /// Full cleanup — abort tasks, mark complete. Call before removing from SessionManager.
-    pub async fn cleanup(&mut self) {
+    /// Abort all background tasks owned by this session: license cleanup
+    /// followups and the auto-stop timer. Called during every terminal
+    /// transition.
+    pub fn abort_all_background_tasks(&mut self) {
         self.abort_license_cleanups();
-        // If still recording (e.g. error path), shut down audio
-        let old_phase = std::mem::replace(&mut self.phase, Phase::Complete);
-        if let Phase::Recording { audio_handle, .. } = old_phase {
-            audio_handle.shutdown().await;
-        }
+        self.abort_auto_stop();
     }
+
 
     // --- UI (consent embed) ---
 
@@ -273,7 +461,7 @@ impl Session {
             match p.scope {
                 None => pending.push(p.display_name.as_str()),
                 Some(ConsentScope::Full) => accepted.push(p.display_name.as_str()),
-                Some(ConsentScope::DeclineAudio | ConsentScope::Decline) => {
+                Some(ConsentScope::Decline) => {
                     declined.push(p.display_name.clone())
                 }
             }
@@ -410,9 +598,22 @@ impl SessionManager {
         Self { sessions: HashMap::new() }
     }
 
-    /// Store a session, keyed by guild ID.
-    pub fn insert(&mut self, session: Session) {
+    /// Atomically reserve a slot for a guild: insert the session if and only
+    /// if there is no existing active session for that guild. Returns `Ok(())`
+    /// on successful reservation, or `Err(session)` handing the session back
+    /// in a Box (Session is ~272 bytes; the Box keeps the Result variant
+    /// sizes balanced per clippy::result_large_err).
+    ///
+    /// This is the only supported insertion path. A raw check-then-insert
+    /// sequence was previously racy because the slow work between the two
+    /// (Data API calls, Discord response) released the mutex and let a
+    /// concurrent /record slip through.
+    pub fn try_insert(&mut self, session: Session) -> Result<(), Box<Session>> {
+        if self.has_active(session.guild_id) {
+            return Err(Box::new(session));
+        }
         self.sessions.insert(session.guild_id, session);
+        Ok(())
     }
 
     /// Look up a session by guild ID.
@@ -430,10 +631,344 @@ impl SessionManager {
         self.sessions.remove(&guild_id)
     }
 
-    /// True if the guild has a session in a non-terminal phase.
+    /// True if the guild has a session the user can still act on.
+    /// Matches every non-terminal phase (AwaitingConsent, StartingRecording,
+    /// Recording). Finalizing / Cancelled / Complete are terminal and not
+    /// counted as "active" — a new /record is allowed once we're past the
+    /// audio capture stage.
     pub fn has_active(&self, guild_id: u64) -> bool {
-        self.sessions.get(&guild_id).is_some_and(|s| {
-            matches!(s.phase, Phase::AwaitingConsent | Phase::Recording { .. } | Phase::Finalizing)
-        })
+        self.sessions
+            .get(&guild_id)
+            .is_some_and(|s| s.phase.is_stoppable())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests — pure logic only (no Songbird Call, no Data API client, no
+// Discord).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serenity::all::UserId;
+
+    fn user(id: u64) -> UserId {
+        UserId::new(id)
+    }
+
+    /// Build a test session with three pending participants.
+    fn session_with_three_participants(min: usize, require_all: bool) -> Session {
+        let mut s = Session::new(
+            /* guild_id */ 111,
+            /* channel_id */ 222,
+            /* text_channel_id */ 333,
+            user(1),
+            min,
+            require_all,
+        );
+        s.add_participant(user(1), "alice".into(), false);
+        s.add_participant(user(2), "bob".into(), false);
+        s.add_participant(user(3), "carol".into(), false);
+        s
+    }
+
+    // --- Phase state ---
+
+    #[test]
+    fn phase_is_stoppable_for_non_terminal_states() {
+        let s = session_with_three_participants(2, true);
+        assert!(s.phase.is_stoppable()); // AwaitingConsent
+    }
+
+    #[test]
+    fn phase_is_terminal_for_finalized_states() {
+        assert!(Phase::Finalizing.is_terminal());
+        assert!(Phase::Cancelled.is_terminal());
+        assert!(Phase::Complete.is_terminal());
+    }
+
+    #[test]
+    fn phase_awaiting_consent_is_not_terminal() {
+        // Regression test: pipeline_aborted in consent.rs uses is_terminal
+        // to decide whether the startup pipeline should bail. If
+        // AwaitingConsent were mistakenly reported as terminal, the FIRST
+        // abort check — which fires BEFORE begin_startup transitions the
+        // session to StartingRecording — would return true and every
+        // recording would bail immediately after voice_joined. This
+        // actually happened in the initial state-machine rework. Keep
+        // this assertion to lock in the fix.
+        let s = session_with_three_participants(2, true);
+        assert!(!s.phase.is_terminal());
+    }
+
+    #[test]
+    fn phase_is_not_stoppable_for_terminal_states() {
+        assert!(!Phase::Finalizing.is_stoppable());
+        assert!(!Phase::Cancelled.is_stoppable());
+        assert!(!Phase::Complete.is_stoppable());
+    }
+
+    // --- add_participant / record_consent ---
+
+    #[test]
+    fn add_participant_is_idempotent() {
+        let mut s = session_with_three_participants(2, true);
+        let before = s.participants.len();
+        s.add_participant(user(1), "alice renamed".into(), false);
+        assert_eq!(s.participants.len(), before);
+        // First write wins — subsequent adds don't overwrite.
+        assert_eq!(s.participants[&user(1)].display_name, "alice");
+    }
+
+    #[test]
+    fn add_participant_defaults_uuid_to_none() {
+        let s = session_with_three_participants(2, true);
+        assert_eq!(s.participants[&user(1)].participant_uuid, None);
+    }
+
+    #[test]
+    fn set_participant_uuid_stores_value() {
+        let mut s = session_with_three_participants(2, true);
+        let pid = uuid::Uuid::new_v4();
+        s.set_participant_uuid(user(1), pid);
+        assert_eq!(s.participant_uuid(user(1)), Some(pid));
+    }
+
+    #[test]
+    fn set_participant_uuid_ignores_unknown_user() {
+        let mut s = session_with_three_participants(2, true);
+        s.set_participant_uuid(user(999), uuid::Uuid::new_v4());
+        // Does NOT silently insert a ghost participant row.
+        assert_eq!(s.participants.len(), 3);
+        assert_eq!(s.participant_uuid(user(999)), None);
+    }
+
+    #[test]
+    fn participant_uuid_returns_none_for_unknown() {
+        let s = session_with_three_participants(2, true);
+        assert_eq!(s.participant_uuid(user(42)), None);
+    }
+
+    #[test]
+    fn license_flags_default_to_false_false() {
+        let s = session_with_three_participants(2, true);
+        assert_eq!(s.license_flags(user(1)), (false, false));
+    }
+
+    #[test]
+    fn set_license_flags_round_trips() {
+        let mut s = session_with_three_participants(2, true);
+        s.set_license_flags(user(1), true, false);
+        assert_eq!(s.license_flags(user(1)), (true, false));
+        s.set_license_flags(user(1), true, true);
+        assert_eq!(s.license_flags(user(1)), (true, true));
+        s.set_license_flags(user(1), false, true);
+        assert_eq!(s.license_flags(user(1)), (false, true));
+    }
+
+    #[test]
+    fn set_license_flags_ignores_unknown_user() {
+        let mut s = session_with_three_participants(2, true);
+        s.set_license_flags(user(999), true, true);
+        // No ghost insertion.
+        assert_eq!(s.participants.len(), 3);
+        assert_eq!(s.license_flags(user(999)), (false, false));
+    }
+
+    #[test]
+    fn set_participant_uuid_survives_record_consent() {
+        // Ordering sanity: caching the UUID then recording consent
+        // should leave both fields populated.
+        let mut s = session_with_three_participants(2, true);
+        let pid = uuid::Uuid::new_v4();
+        s.set_participant_uuid(user(1), pid);
+        s.record_consent(user(1), ConsentScope::Full);
+        let p = &s.participants[&user(1)];
+        assert_eq!(p.participant_uuid, Some(pid));
+        assert_eq!(p.scope, Some(ConsentScope::Full));
+    }
+
+    #[test]
+    fn record_consent_sets_scope_and_timestamp() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        let p = &s.participants[&user(1)];
+        assert_eq!(p.scope, Some(ConsentScope::Full));
+        assert!(p.consented_at.is_some());
+    }
+
+    #[test]
+    fn record_consent_ignores_unknown_user() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(999), ConsentScope::Full);
+        // No panic, no new participant.
+        assert_eq!(s.participants.len(), 3);
+    }
+
+    // --- Response tracking ---
+
+    #[test]
+    fn all_responded_false_when_some_pending() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        assert!(!s.all_responded());
+    }
+
+    #[test]
+    fn all_responded_true_when_every_participant_replied() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Decline);
+        assert!(s.all_responded());
+    }
+
+    #[test]
+    fn has_decline_flags_any_decliner() {
+        let mut s = session_with_three_participants(2, true);
+        assert!(!s.has_decline());
+        s.record_consent(user(1), ConsentScope::Full);
+        assert!(!s.has_decline());
+        s.record_consent(user(2), ConsentScope::Decline);
+        assert!(s.has_decline());
+    }
+
+    #[test]
+    fn consented_user_ids_lists_only_full_scope() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Decline);
+        s.record_consent(user(3), ConsentScope::Full);
+        let ids = s.consented_user_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&user(1)));
+        assert!(ids.contains(&user(3)));
+    }
+
+    // --- Quorum evaluation ---
+
+    #[test]
+    fn quorum_passes_when_min_accepts_and_no_decline() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Full);
+        assert!(s.evaluate_quorum());
+    }
+
+    #[test]
+    fn quorum_fails_when_require_all_and_someone_declines() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Decline);
+        assert!(!s.evaluate_quorum());
+    }
+
+    #[test]
+    fn quorum_passes_when_not_require_all_and_min_met() {
+        let mut s = session_with_three_participants(2, false);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Decline);
+        assert!(s.evaluate_quorum());
+    }
+
+    #[test]
+    fn quorum_fails_when_below_min_even_without_declines() {
+        let mut s = session_with_three_participants(3, false);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        assert!(!s.evaluate_quorum());
+    }
+
+    // --- Metadata serialization ---
+
+    #[test]
+    fn meta_json_round_trips_to_valid_json() {
+        let s = session_with_three_participants(2, true);
+        let bytes = s.meta_json();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["session_id"], s.id);
+        assert_eq!(parsed["participant_count"], 3);
+        assert_eq!(parsed["audio_format"]["sample_rate"], 48000);
+        assert_eq!(parsed["audio_format"]["bit_depth"], 16);
+    }
+
+    #[test]
+    fn consent_json_includes_every_participant_keyed_by_pseudo() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Decline);
+        let bytes = s.consent_json();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["license"], "CC BY-SA 4.0");
+        let participants = parsed["participants"].as_object().unwrap();
+        assert_eq!(participants.len(), 3);
+        // Every key is a 16-char hex pseudonym
+        for k in participants.keys() {
+            assert_eq!(k.len(), 16);
+            assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn meta_json_audio_count_reflects_full_consent_only() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Decline);
+        let bytes = s.meta_json();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["consented_audio_count"], 2);
+        assert_eq!(parsed["participant_count"], 3);
+    }
+
+    // --- SessionManager atomicity ---
+    //
+    // Session isn't Debug (carries non-Debug songbird/tokio handles), so
+    // `.unwrap()` / `.unwrap_err()` on try_insert's Result<(), Box<Session>>
+    // won't compile. We use an explicit `if is_err { panic }` helper and
+    // match for the Err-inspecting test.
+
+    fn try_insert_or_panic(mgr: &mut SessionManager, s: Session) {
+        if mgr.try_insert(s).is_err() {
+            panic!("try_insert failed unexpectedly");
+        }
+    }
+
+    #[test]
+    fn session_manager_try_insert_ok_when_empty() {
+        let mut mgr = SessionManager::new();
+        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
+        assert!(mgr.has_active(111));
+    }
+
+    #[test]
+    fn session_manager_try_insert_rejects_duplicate_guild() {
+        let mut mgr = SessionManager::new();
+        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
+        let second = session_with_three_participants(2, true);
+        let second_id = second.id.clone();
+        match mgr.try_insert(second) {
+            Err(rejected) => assert_eq!(rejected.id, second_id),
+            Ok(()) => panic!("expected try_insert to reject duplicate guild"),
+        }
+    }
+
+    #[test]
+    fn session_manager_try_insert_ok_after_remove() {
+        let mut mgr = SessionManager::new();
+        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
+        mgr.remove(111);
+        assert!(!mgr.has_active(111));
+        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
+    }
+
+    #[test]
+    fn session_manager_has_active_false_for_empty() {
+        let mgr = SessionManager::new();
+        assert!(!mgr.has_active(111));
     }
 }

@@ -10,39 +10,25 @@ pub struct Config {
     #[arg(long, env = "DISCORD_TOKEN")]
     pub token: String,
 
-    /// S3-compatible endpoint URL
-    #[arg(long, env = "S3_ENDPOINT")]
-    pub s3_endpoint: String,
+    /// Data API base URL
+    #[arg(long, env = "DATA_API_URL", default_value = "http://127.0.0.1:8001")]
+    pub data_api_url: String,
 
-    /// S3 access key
-    #[arg(long, env = "S3_ACCESS_KEY")]
-    pub s3_access_key: String,
-
-    /// S3 secret key
-    #[arg(long, env = "S3_SECRET_KEY")]
-    pub s3_secret_key: String,
-
-    /// S3 bucket name
-    #[arg(long, env = "S3_BUCKET", default_value = "ttrpg-dataset-raw")]
-    pub s3_bucket: String,
+    /// Shared secret for Data API auth
+    #[arg(long, env = "DATA_API_SHARED_SECRET")]
+    pub data_api_shared_secret: String,
 
     /// Local buffer directory
     #[arg(long, env = "LOCAL_BUFFER_DIR", default_value = "./sessions")]
     pub local_buffer_dir: String,
 
-    /// Minimum participants to start recording
-    #[arg(long, env = "MIN_PARTICIPANTS", default_value = "2")]
+    /// Minimum participants to start recording. Defaults to 1 (solo dev
+    /// testing). Prod deployments that want quorum should set
+    /// MIN_PARTICIPANTS=2 (or higher) in their env file.
+    #[arg(long, env = "MIN_PARTICIPANTS", default_value = "1")]
     pub min_participants: usize,
 
     /// Require all participants to consent
     #[arg(long, env = "REQUIRE_ALL_CONSENT", default_value = "true")]
     pub require_all_consent: bool,
-
-    /// S3 chunk size in bytes before flushing (default 5MB)
-    #[arg(long, env = "S3_CHUNK_SIZE", default_value = "5242880")]
-    pub s3_chunk_size: usize,
-
-    /// Postgres database URL
-    #[arg(long, env = "DATABASE_URL")]
-    pub database_url: String,
 }

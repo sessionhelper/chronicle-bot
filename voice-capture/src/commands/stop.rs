@@ -3,7 +3,6 @@
 use serenity::all::*;
 use tracing::{error, info};
 
-use crate::db;
 use crate::session::{Phase, Session};
 use crate::state::AppState;
 
@@ -29,88 +28,161 @@ async fn cleanup_session_ui(ctx: &Context, session: &Session) {
     }
 }
 
-/// Flush remaining audio buffers to S3 and upload metadata.
-/// Transitions the session through Finalizing -> uploading metadata.
-/// Shared by both /stop and auto-stop.
+/// Action to take when stopping a session, dispatched on current phase.
+enum StopAction {
+    /// Phase::Recording — flush audio, upload metadata, mark complete
+    Finalize,
+    /// Phase::StartingRecording — shut down pipeline, mark abandoned (no
+    /// metadata to upload, no audio chunks to flush)
+    CancelStartup,
+    /// Phase::AwaitingConsent — no pipeline to tear down, just mark
+    /// abandoned in the Data API and remove
+    RemovePending,
+    /// Already terminal or session gone — no-op
+    NoOp,
+}
+
+/// Stop a session by dispatching on its current phase.
+///
+/// This is the only correct path for /stop and auto_stop. It replaces the
+/// old finalize_session that unconditionally ran the full metadata-upload
+/// path regardless of whether the session had actually recorded anything —
+/// an assumption that was wrong for StartingRecording and AwaitingConsent,
+/// and manifested as: orphan Data API rows, double-decrement of the
+/// sessions_active gauge, and metadata uploads with zero audio.
 #[tracing::instrument(skip_all, fields(guild_id = guild_id))]
 async fn finalize_session(
     _ctx: &Context,
     state: &AppState,
     guild_id: u64,
 ) {
-    // Finalize: shut down audio pipeline, set ended_at
-    {
-        let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(guild_id) {
-            session.finalize().await;
-        }
-    }
-
-    // Upload meta.json and consent.json to S3 (read-only lock on session data)
-    let (meta_json, consent_json, session_id, s3_prefix_base, participant_count) = {
+    // Snapshot phase + identity under one lock, then release before any
+    // network work.
+    let (action, session_id, participant_count) = {
         let sessions = state.sessions.lock().await;
         match sessions.get(guild_id) {
-            Some(session) => {
-                let s3_base = format!("sessions/{}/{}", guild_id, session.id);
-                (
-                    session.meta_json(),
-                    session.consent_json(),
-                    session.id.clone(),
-                    s3_base,
-                    session.participants.len() as i32,
-                )
+            Some(s) => {
+                let action = match &s.phase {
+                    Phase::Recording(_) => StopAction::Finalize,
+                    Phase::StartingRecording(_) => StopAction::CancelStartup,
+                    Phase::AwaitingConsent => StopAction::RemovePending,
+                    _ => StopAction::NoOp,
+                };
+                (action, s.id.clone(), s.participants.len() as i32)
             }
             None => return,
         }
     };
 
-    let meta_key = format!("{}/meta.json", s3_prefix_base);
-    let consent_key = format!("{}/consent.json", s3_prefix_base);
-
-    match state.s3.upload_bytes(&meta_key, meta_json).await {
-        Ok(_) => {
-            metrics::counter!("ttrpg_s3_uploads_total", "type" => "meta", "outcome" => "success").increment(1);
-        }
-        Err(e) => {
-            error!(error = %e, "meta_upload_failed");
-            metrics::counter!("ttrpg_s3_uploads_total", "type" => "meta", "outcome" => "failure").increment(1);
+    match action {
+        StopAction::NoOp => {}
+        StopAction::RemovePending => stop_pending(state, guild_id, &session_id).await,
+        StopAction::CancelStartup => stop_starting(state, guild_id, &session_id).await,
+        StopAction::Finalize => {
+            stop_recording(state, guild_id, &session_id, participant_count).await
         }
     }
-    match state.s3.upload_bytes(&consent_key, consent_json).await {
-        Ok(_) => {
-            metrics::counter!("ttrpg_s3_uploads_total", "type" => "consent", "outcome" => "success").increment(1);
+}
+
+/// Stop path for Phase::AwaitingConsent: no pipeline running yet, just mark
+/// the Data API session row abandoned and drop the local state.
+async fn stop_pending(state: &AppState, guild_id: u64, session_id: &str) {
+    if let Ok(sid) = uuid::Uuid::parse_str(session_id)
+        && let Err(e) = state.api.abandon_session(sid).await
+    {
+        error!("API call failed (abandon_session): {e}");
+    }
+    info!(session_id = %session_id, "session_cancelled_pending");
+    let mut sessions = state.sessions.lock().await;
+    if let Some(s) = sessions.get_mut(guild_id) {
+        s.abort_all_background_tasks();
+    }
+    sessions.remove(guild_id);
+}
+
+/// Stop path for Phase::StartingRecording: audio pipeline is spun up but
+/// DAVE never confirmed, so there is nothing to upload. Drain and shut down
+/// the pipeline, mark the session abandoned in the Data API, remove.
+async fn stop_starting(state: &AppState, guild_id: u64, session_id: &str) {
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(guild_id) {
+            s.cancel_startup().await;
         }
-        Err(e) => {
-            error!(error = %e, "consent_upload_failed");
-            metrics::counter!("ttrpg_s3_uploads_total", "type" => "consent", "outcome" => "failure").increment(1);
+    }
+
+    if let Ok(sid) = uuid::Uuid::parse_str(session_id)
+        && let Err(e) = state.api.abandon_session(sid).await
+    {
+        error!("API call failed (abandon_session): {e}");
+    }
+
+    info!(session_id = %session_id, "session_cancelled_starting");
+    let mut sessions = state.sessions.lock().await;
+    if let Some(s) = sessions.get_mut(guild_id) {
+        s.abort_all_background_tasks();
+        s.complete();
+    }
+    sessions.remove(guild_id);
+}
+
+/// Stop path for Phase::Recording: the full "normal /stop" flow. Flush audio
+/// buffers, upload meta.json + consent.json, mark status=complete in the
+/// Data API, remove.
+async fn stop_recording(
+    state: &AppState,
+    guild_id: u64,
+    session_id: &str,
+    participant_count: i32,
+) {
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(guild_id) {
+            s.finalize().await;
+        }
+    }
+
+    let (meta_json, consent_json) = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(guild_id) {
+            Some(s) => (s.meta_json(), s.consent_json()),
+            None => return,
+        }
+    };
+
+    let meta_value: Option<serde_json::Value> = serde_json::from_slice(&meta_json).ok();
+    let consent_value: Option<serde_json::Value> = serde_json::from_slice(&consent_json).ok();
+
+    if let Ok(sid) = uuid::Uuid::parse_str(session_id) {
+        match state.api.write_metadata(sid, meta_value, consent_value).await {
+            Ok(_) => {
+                metrics::counter!("ttrpg_uploads_total", "type" => "metadata", "outcome" => "success").increment(1);
+            }
+            Err(e) => {
+                error!(error = %e, "metadata_upload_failed");
+                metrics::counter!("ttrpg_uploads_total", "type" => "metadata", "outcome" => "failure").increment(1);
+            }
         }
     }
 
     metrics::gauge!("ttrpg_sessions_active").decrement(1.0);
     info!(session_id = %session_id, "session_finalized");
 
-    // Finalize session in Postgres
-    if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
-        let finalized = db::FinalizedSession {
-            session_id: sid,
-            ended_at: chrono::Utc::now(),
-            participant_count,
-            s3_prefix: Some(s3_prefix_base),
-        };
-        if let Err(e) = db::finalize_session(&state.db, &finalized).await {
-            error!("DB write failed (finalize_session): {e}");
-        }
+    if let Ok(sid) = uuid::Uuid::parse_str(session_id)
+        && let Err(e) = state
+            .api
+            .finalize_session(sid, chrono::Utc::now(), participant_count)
+            .await
+    {
+        error!("API call failed (finalize_session): {e}");
     }
 
-    // Mark session complete and remove from manager
-    {
-        let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(guild_id) {
-            session.abort_license_cleanups();
-            session.complete();
-        }
-        sessions.remove(guild_id);
+    let mut sessions = state.sessions.lock().await;
+    if let Some(s) = sessions.get_mut(guild_id) {
+        s.abort_all_background_tasks();
+        s.complete();
     }
+    sessions.remove(guild_id);
 }
 
 /// Handle the /stop slash command.
@@ -124,20 +196,32 @@ pub async fn handle_stop(
 ) -> Result<(), serenity::Error> {
     let guild_id = command.guild_id.unwrap();
 
-    // Verify there's an active recording and the caller is the initiator
+    // Defer IMMEDIATELY — before any lock acquisition or other async work.
+    // Discord's interaction-response window is 3 seconds; deferring extends
+    // it to 15 minutes and lets us take our time on session-lock contention,
+    // audio flushing, S3 uploads, etc.
+    command
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Defer(
+                CreateInteractionResponseMessage::new().ephemeral(true),
+            ),
+        )
+        .await?;
+
+    // Verify there's a stoppable session for this guild. is_stoppable
+    // matches AwaitingConsent | StartingRecording | Recording — the three
+    // phases where the user might visibly expect /stop to do something.
     let _session_id = {
         let sessions = state.sessions.lock().await;
         match sessions.get(guild_id.get()) {
-            Some(s) if matches!(s.phase, Phase::Recording { .. }) => {
+            Some(s) if s.phase.is_stoppable() => {
                 if s.initiator_id != command.user.id {
                     command
-                        .create_response(
+                        .edit_response(
                             &ctx.http,
-                            CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content("Only the person who started the recording can stop it.")
-                                    .ephemeral(true),
-                            ),
+                            EditInteractionResponse::new()
+                                .content("Only the person who started the recording can stop it."),
                         )
                         .await?;
                     return Ok(());
@@ -146,13 +230,10 @@ pub async fn handle_stop(
             }
             _ => {
                 command
-                    .create_response(
+                    .edit_response(
                         &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content("No active recording in this server.")
-                                .ephemeral(true),
-                        ),
+                        EditInteractionResponse::new()
+                            .content("No active recording in this server."),
                     )
                     .await?;
                 return Ok(());
@@ -161,13 +242,9 @@ pub async fn handle_stop(
     };
 
     command
-        .create_response(
+        .edit_response(
             &ctx.http,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("Wrapping up...")
-                    .ephemeral(true),
-            ),
+            EditInteractionResponse::new().content("Wrapping up..."),
         )
         .await?;
 
@@ -193,7 +270,7 @@ pub async fn handle_stop(
         }
     }
 
-    // Flush audio buffers to S3, upload metadata, update Postgres, remove session
+    // Flush audio buffers, upload metadata, update Data API, remove session
     finalize_session(ctx, state, guild_id.get()).await;
 
     command
