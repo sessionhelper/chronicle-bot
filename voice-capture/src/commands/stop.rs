@@ -88,9 +88,9 @@ async fn finalize_session(
 /// the Data API session row abandoned and drop the local state.
 async fn stop_pending(state: &AppState, guild_id: u64, session_id: &str) {
     if let Ok(sid) = uuid::Uuid::parse_str(session_id)
-        && let Err(e) = state.api.update_session_state(sid, "abandoned").await
+        && let Err(e) = state.api.abandon_session(sid).await
     {
-        error!("API call failed (update_session_state=abandoned): {e}");
+        error!("API call failed (abandon_session): {e}");
     }
     info!(session_id = %session_id, "session_cancelled_pending");
     let mut sessions = state.sessions.lock().await;
@@ -112,9 +112,9 @@ async fn stop_starting(state: &AppState, guild_id: u64, session_id: &str) {
     }
 
     if let Ok(sid) = uuid::Uuid::parse_str(session_id)
-        && let Err(e) = state.api.update_session_state(sid, "abandoned").await
+        && let Err(e) = state.api.abandon_session(sid).await
     {
-        error!("API call failed (update_session_state=abandoned): {e}");
+        error!("API call failed (abandon_session): {e}");
     }
 
     info!(session_id = %session_id, "session_cancelled_starting");

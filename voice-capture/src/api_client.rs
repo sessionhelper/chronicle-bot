@@ -251,6 +251,27 @@ impl DataApiClient {
         Ok(check_status(resp).await?.json().await?)
     }
 
+    /// Mark a session abandoned: PATCH both status="abandoned" and
+    /// ended_at=now() in a single call. Atomic from the server's POV —
+    /// avoids the bug where an abandoned row has status=abandoned but
+    /// ended_at=NULL, which made "sessions ended today" queries miss
+    /// abandoned runs. Prefer this over update_session_state("abandoned")
+    /// so the intent is explicit at every call site.
+    pub async fn abandon_session(&self, session_id: Uuid) -> Result<SessionResponse, ApiError> {
+        let resp = self
+            .client
+            .patch(format!("{}/internal/sessions/{}", self.base_url, session_id))
+            .header("authorization", self.auth_header())
+            .json(&UpdateSessionRequest {
+                status: Some("abandoned".to_string()),
+                ended_at: Some(Utc::now()),
+                participant_count: None,
+            })
+            .send()
+            .await?;
+        Ok(check_status(resp).await?.json().await?)
+    }
+
     /// Finalize a session: set ended_at, participant_count, and status=complete
     /// (replaces db::finalize_session).
     pub async fn finalize_session(
