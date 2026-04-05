@@ -44,24 +44,85 @@ pub struct ParticipantConsent {
     pub mid_session_join: bool,
 }
 
-/// All possible session states. Each variant carries only the data relevant to that phase.
+/// Fields owned by both `StartingRecording` and `Recording` phases. The audio
+/// pipeline is created at the StartingRecording transition and kept alive
+/// through to Finalizing — splitting these fields into their own struct lets
+/// both variants share the exact same shape without code duplication.
+pub struct RecordingPipeline {
+    pub audio_tx: mpsc::Sender<AudioPacket>,
+    pub audio_handle: AudioHandle,
+    pub ssrc_map: Arc<StdMutex<HashMap<u32, u64>>>,
+    pub consented_users: Arc<Mutex<HashSet<u64>>>,
+}
+
+/// Full session lifecycle.
+///
+/// ```text
+///   AwaitingConsent
+///     │
+///     │ (quorum met, begin_startup)
+///     ▼
+///   StartingRecording ─────────────────┐ (/stop or DAVE failed)
+///     │                                │
+///     │ (DAVE audio confirmed,         ▼
+///     │  confirm_recording)         Cancelled ──▶ removed
+///     ▼
+///   Recording
+///     │
+///     │ (/stop or auto_stop, finalize)
+///     ▼
+///   Finalizing
+///     │
+///     │ (metadata uploaded, complete)
+///     ▼
+///   Complete ──▶ removed
+/// ```
+///
+/// The key property: a phase transition IS the cancellation mechanism. If
+/// /stop fires during StartingRecording, the startup pipeline sees the phase
+/// change on its next lock acquisition and bails cleanly. No separate flag,
+/// no polling of an AtomicBool, no unwrap() panics when concurrent cleanup
+/// removes the session out from under a running task.
 pub enum Phase {
     /// Waiting for all participants to accept/decline.
     AwaitingConsent,
 
-    /// Bot is in voice, actively capturing audio.
-    Recording {
-        audio_tx: mpsc::Sender<AudioPacket>,
-        audio_handle: AudioHandle,
-        ssrc_map: Arc<StdMutex<HashMap<u32, u64>>>,
-        consented_users: Arc<Mutex<HashSet<u64>>>,
-    },
+    /// Quorum met. Voice channel joined, audio pipeline created, DAVE
+    /// handshake in progress. Carries the pipeline even though no audio is
+    /// flowing yet — the `audio_received` flag flips to true inside VoiceTick
+    /// when DAVE starts delivering decoded frames.
+    StartingRecording(RecordingPipeline),
 
-    /// /stop called, flushing buffers and uploading metadata.
+    /// DAVE confirmed. Audio flowing, chunks uploading.
+    Recording(RecordingPipeline),
+
+    /// /stop or auto_stop fired during Recording. Metadata is uploading.
     Finalizing,
 
-    /// Session complete — kept briefly for cleanup, then removed.
+    /// /stop fired during StartingRecording, or DAVE gave up after retries.
+    /// No metadata to upload; Data API row marked `abandoned`.
+    Cancelled,
+
+    /// Terminal state. Session about to be removed from the manager.
     Complete,
+}
+
+impl Phase {
+    /// True if /stop can act on this phase (i.e. a session visibly exists
+    /// from the user's perspective).
+    pub fn is_stoppable(&self) -> bool {
+        matches!(
+            self,
+            Self::AwaitingConsent | Self::StartingRecording(_) | Self::Recording(_)
+        )
+    }
+
+    /// True if this phase means the session is on its way out — no further
+    /// state mutation should happen except the final remove.
+    #[allow(dead_code)] // Symmetric API to is_stoppable; kept for readers
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Finalizing | Self::Cancelled | Self::Complete)
+    }
 }
 
 /// A single recording session. One per guild, owns all session state.
@@ -90,17 +151,6 @@ pub struct Session {
 
     // Audio config
     pub audio_received: Arc<std::sync::atomic::AtomicBool>,
-
-    /// Cooperative cancellation for the startup pipeline (voice join, DAVE
-    /// wait, recording_started). /stop and auto_stop flip this to `true`
-    /// before tearing the session down, so a concurrently-running startup
-    /// task can check the flag at each await point and bail out cleanly
-    /// instead of continuing to mutate a session that's being finalized.
-    ///
-    /// The flag is tied to this specific Session instance — it is a
-    /// separate `Arc` so the startup task can hold a clone that stays
-    /// valid even after the session is removed from the manager.
-    pub startup_cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Session {
@@ -130,7 +180,6 @@ impl Session {
             license_followups: Vec::new(),
             license_cleanup_tasks: Vec::new(),
             audio_received: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            startup_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -184,83 +233,125 @@ impl Session {
 
     // --- Phase transitions ---
 
-    /// Transition from AwaitingConsent -> Recording.
-    /// Creates the audio pipeline and returns the channel sender for DAVE retries.
+    /// AwaitingConsent → StartingRecording. Creates the audio pipeline and
+    /// joins the Songbird call, but leaves the session in the transient
+    /// "starting" phase until DAVE delivers decoded audio. Returns the audio
+    /// channel sender for DAVE retry reattachment.
     #[tracing::instrument(skip_all, fields(session_id = %self.id, guild_id = self.guild_id))]
-    pub fn start_recording(
+    pub fn begin_startup(
         &mut self,
         call: &mut songbird::Call,
         api: Arc<DataApiClient>,
     ) -> mpsc::Sender<AudioPacket> {
-        let consented_set: HashSet<u64> = self.consented_user_ids()
+        let consented_set: HashSet<u64> = self
+            .consented_user_ids()
             .into_iter()
             .map(|uid| uid.get())
             .collect();
         let consented_users = Arc::new(Mutex::new(consented_set));
 
-        // Parse session UUID for the API client
-        let session_uuid = uuid::Uuid::parse_str(&self.id)
-            .expect("session id is always a valid UUID");
+        let session_uuid =
+            uuid::Uuid::parse_str(&self.id).expect("session id is always a valid UUID");
 
-        // Create pipeline once — single buffer task for the session
-        let (audio_tx, audio_handle) = AudioReceiver::create_pipeline(
-            api, session_uuid,
-        );
-
-        // Attach to the Songbird Call
+        let (audio_tx, audio_handle) = AudioReceiver::create_pipeline(api, session_uuid);
         let ssrc_map = AudioReceiver::attach(
-            call, audio_tx.clone(), consented_users.clone(), self.audio_received.clone(),
+            call,
+            audio_tx.clone(),
+            consented_users.clone(),
+            self.audio_received.clone(),
         );
 
-        self.phase = Phase::Recording {
+        self.phase = Phase::StartingRecording(RecordingPipeline {
             audio_tx: audio_tx.clone(),
             audio_handle,
             ssrc_map,
             consented_users,
-        };
+        });
 
         audio_tx
     }
 
-    /// Re-attach audio receiver after a DAVE retry (new Songbird Call).
-    /// Reuses the existing pipeline — same channel, same buffer task.
+    /// StartingRecording → Recording, once DAVE has delivered decoded audio.
+    /// Idempotent: if called while already in Recording (e.g. after a retry
+    /// path), does nothing. If called in any other phase, does nothing —
+    /// the session was preempted between the audio-detected check and here.
+    pub fn confirm_recording(&mut self) {
+        let placeholder = Phase::AwaitingConsent;
+        let current = std::mem::replace(&mut self.phase, placeholder);
+        self.phase = match current {
+            Phase::StartingRecording(data) => Phase::Recording(data),
+            other => other,
+        };
+    }
+
+    /// Re-attach the audio receiver to a new Songbird Call after a DAVE
+    /// retry (leave + rejoin). Reuses the existing pipeline — same channel,
+    /// same buffer task. Only valid during StartingRecording; silently
+    /// ignored in other phases.
     pub fn reattach_audio(&mut self, call: &mut songbird::Call) {
-        if let Phase::Recording { audio_tx, consented_users, ssrc_map, .. } = &mut self.phase {
+        if let Phase::StartingRecording(data) = &mut self.phase {
             let new_ssrc_map = AudioReceiver::attach(
-                call, audio_tx.clone(), consented_users.clone(), self.audio_received.clone(),
+                call,
+                data.audio_tx.clone(),
+                data.consented_users.clone(),
+                self.audio_received.clone(),
             );
-            *ssrc_map = new_ssrc_map;
+            data.ssrc_map = new_ssrc_map;
         }
     }
 
-    /// Check if DAVE is delivering audio.
+    /// Check if DAVE is delivering audio. Returns the underlying atomic flag
+    /// that VoiceTick flips to true on the first decoded packet.
     pub fn has_audio(&self) -> bool {
-        self.audio_received.load(std::sync::atomic::Ordering::Relaxed)
+        self.audio_received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Check if any SSRC has been mapped (DAVE connection alive, even if silent).
+    /// Check if any SSRC has been mapped (DAVE connection alive, even if
+    /// silent). Valid during StartingRecording and Recording.
     pub fn has_ssrc(&self) -> bool {
-        if let Phase::Recording { ssrc_map, .. } = &self.phase {
-            let map = ssrc_map.lock().expect("ssrc_map poisoned");
-            !map.is_empty()
-        } else {
-            false
+        match &self.phase {
+            Phase::StartingRecording(data) | Phase::Recording(data) => {
+                let map = data.ssrc_map.lock().expect("ssrc_map poisoned");
+                !map.is_empty()
+            }
+            _ => false,
         }
     }
 
-    /// Transition from Recording -> Finalizing. Shuts down audio pipeline.
+    /// Recording → Finalizing. Shuts down the audio pipeline and marks the
+    /// session as ended. Called by /stop and auto_stop on the happy path.
+    ///
+    /// If called in StartingRecording (e.g. /stop fires before DAVE confirmed)
+    /// this still shuts the pipeline down but the caller should treat the
+    /// session as cancelled, not finalized — prefer `cancel_startup` in that
+    /// case so metadata upload is skipped.
     #[tracing::instrument(skip_all, fields(session_id = %self.id))]
     pub async fn finalize(&mut self) {
         self.ended_at = Some(Utc::now());
-
-        // Take the audio handle out of the phase and shut it down
         let old_phase = std::mem::replace(&mut self.phase, Phase::Finalizing);
-        if let Phase::Recording { audio_handle, .. } = old_phase {
-            audio_handle.shutdown().await;
+        match old_phase {
+            Phase::Recording(data) | Phase::StartingRecording(data) => {
+                data.audio_handle.shutdown().await;
+            }
+            _ => {}
         }
     }
 
-    /// Mark session as complete.
+    /// StartingRecording → Cancelled. Called when /stop fires before DAVE
+    /// confirms, or when DAVE gives up after retries. Shuts the pipeline
+    /// down but the caller skips metadata upload — there is nothing to
+    /// upload.
+    #[tracing::instrument(skip_all, fields(session_id = %self.id))]
+    pub async fn cancel_startup(&mut self) {
+        self.ended_at = Some(Utc::now());
+        let old_phase = std::mem::replace(&mut self.phase, Phase::Cancelled);
+        if let Phase::StartingRecording(data) = old_phase {
+            data.audio_handle.shutdown().await;
+        }
+    }
+
+    /// Finalizing → Complete. Last step before the session is removed.
     pub fn complete(&mut self) {
         self.phase = Phase::Complete;
     }
@@ -274,15 +365,6 @@ impl Session {
         }
     }
 
-    /// Full cleanup — abort tasks, mark complete. Call before removing from SessionManager.
-    pub async fn cleanup(&mut self) {
-        self.abort_license_cleanups();
-        // If still recording (e.g. error path), shut down audio
-        let old_phase = std::mem::replace(&mut self.phase, Phase::Complete);
-        if let Phase::Recording { audio_handle, .. } = old_phase {
-            audio_handle.shutdown().await;
-        }
-    }
 
     // --- UI (consent embed) ---
 
@@ -467,10 +549,14 @@ impl SessionManager {
         self.sessions.remove(&guild_id)
     }
 
-    /// True if the guild has a session in a non-terminal phase.
+    /// True if the guild has a session the user can still act on.
+    /// Matches every non-terminal phase (AwaitingConsent, StartingRecording,
+    /// Recording). Finalizing / Cancelled / Complete are terminal and not
+    /// counted as "active" — a new /record is allowed once we're past the
+    /// audio capture stage.
     pub fn has_active(&self, guild_id: u64) -> bool {
-        self.sessions.get(&guild_id).is_some_and(|s| {
-            matches!(s.phase, Phase::AwaitingConsent | Phase::Recording { .. } | Phase::Finalizing)
-        })
+        self.sessions
+            .get(&guild_id)
+            .is_some_and(|s| s.phase.is_stoppable())
     }
 }
