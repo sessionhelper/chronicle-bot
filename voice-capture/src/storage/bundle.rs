@@ -10,16 +10,11 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 /// What a participant chose when presented with the consent prompt.
-/// Defined here (in the lib crate) so both the binary's session module
-/// and the storage serialization structs can use it without circular deps.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentScope {
     /// Participant consented to full audio capture and release.
     Full,
-    /// Reserved for future use: participant declined audio but allowed metadata.
-    #[allow(dead_code)]
-    DeclineAudio,
     /// Participant declined all recording.
     Decline,
 }

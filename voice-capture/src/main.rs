@@ -318,7 +318,6 @@ async fn handle_consent_button(
     let scope_label = match scope {
         ConsentScope::Full => "full",
         ConsentScope::Decline => "decline",
-        ConsentScope::DeclineAudio => "decline_audio",
     };
     metrics::counter!("ttrpg_consent_responses_total", "scope" => scope_label).increment(1);
 
@@ -730,7 +729,6 @@ async fn handle_consent_button(
             let scope_str = match scope {
                 ConsentScope::Full => "full",
                 ConsentScope::Decline => "decline",
-                ConsentScope::DeclineAudio => "decline_audio",
             };
             if let Err(e) = state.api.record_consent(sid, user_id.get(), scope_str).await {
                 tracing::error!("API call failed (record_consent): {e}");

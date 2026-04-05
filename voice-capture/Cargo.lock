@@ -4154,7 +4154,6 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "dashmap 6.1.0",
  "hex",
  "metrics",
  "metrics-exporter-prometheus",

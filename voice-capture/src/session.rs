@@ -286,7 +286,7 @@ impl Session {
             match p.scope {
                 None => pending.push(p.display_name.as_str()),
                 Some(ConsentScope::Full) => accepted.push(p.display_name.as_str()),
-                Some(ConsentScope::DeclineAudio | ConsentScope::Decline) => {
+                Some(ConsentScope::Decline) => {
                     declined.push(p.display_name.clone())
                 }
             }
@@ -426,15 +426,16 @@ impl SessionManager {
     /// Atomically reserve a slot for a guild: insert the session if and only
     /// if there is no existing active session for that guild. Returns `Ok(())`
     /// on successful reservation, or `Err(session)` handing the session back
-    /// if the slot was already taken.
+    /// in a Box (Session is ~272 bytes; the Box keeps the Result variant
+    /// sizes balanced per clippy::result_large_err).
     ///
     /// This is the only supported insertion path. A raw check-then-insert
     /// sequence was previously racy because the slow work between the two
     /// (Data API calls, Discord response) released the mutex and let a
     /// concurrent /record slip through.
-    pub fn try_insert(&mut self, session: Session) -> Result<(), Session> {
+    pub fn try_insert(&mut self, session: Session) -> Result<(), Box<Session>> {
         if self.has_active(session.guild_id) {
-            return Err(session);
+            return Err(Box::new(session));
         }
         self.sessions.insert(session.guild_id, session);
         Ok(())
