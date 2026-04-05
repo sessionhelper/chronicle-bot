@@ -437,6 +437,13 @@ async fn handle_consent_button(
                     if attempt == MAX_ATTEMPTS {
                         metrics::counter!("ttrpg_dave_attempts_total", "outcome" => "failure").increment(1);
                         warn!("dave_failed — no audio or ssrc after {MAX_ATTEMPTS} attempts");
+                        // Tell the Data API before we drop the local state, so the
+                        // sessions row doesn't stay stuck in awaiting_consent forever.
+                        if let Ok(sid) = uuid::Uuid::parse_str(&session_id)
+                            && let Err(e) = state.api.update_session_state(sid, "abandoned").await
+                        {
+                            error!("API call failed (update_session_state=abandoned): {e}");
+                        }
                         // Clean up: shut down audio pipeline, leave voice, remove session
                         {
                             let mut sessions = state.sessions.lock().await;
@@ -468,6 +475,13 @@ async fn handle_consent_button(
                         }
                         Err(e) => {
                             error!(error = %e, attempt = attempt, "dave_rejoin_failed");
+                            // Mark the session abandoned in the Data API before clearing
+                            // local state so the row doesn't dangle.
+                            if let Ok(sid) = uuid::Uuid::parse_str(&session_id)
+                                && let Err(e) = state.api.update_session_state(sid, "abandoned").await
+                            {
+                                error!("API call failed (update_session_state=abandoned): {e}");
+                            }
                             // Clean up everything on rejoin failure
                             {
                                 let mut sessions = state.sessions.lock().await;
