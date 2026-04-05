@@ -69,11 +69,19 @@ pub async fn handle_voice_state_update(
         .await;
     }
 
-    // Auto-stop detection always runs — even if this event was a join,
-    // because someone could be leaving as the last person joined (rare but
-    // possible with rapid reconnects).
-    if channel_humans(&ctx, guild_id, channel_id).is_some_and(|n| n == 0) {
-        schedule_auto_stop(ctx.clone(), state.clone(), guild_id, channel_id);
+    // Auto-stop arming: if the channel is now empty, schedule a timer.
+    // If someone just rejoined and the channel isn't empty any more, abort
+    // any pending timer so we don't auto-stop on them after they leave
+    // again via a different path.
+    match channel_humans(&ctx, guild_id, channel_id) {
+        Some(0) => schedule_auto_stop(ctx.clone(), state.clone(), guild_id, channel_id).await,
+        Some(_) => {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(s) = sessions.get_mut(guild_id.get()) {
+                s.abort_auto_stop();
+            }
+        }
+        None => {}
     }
 }
 
@@ -189,25 +197,29 @@ fn channel_humans(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) -> Op
     )
 }
 
-/// Spawn a detached 30-second timer that finalizes the session if the
-/// channel is still empty when it fires. Re-checked after the delay to
-/// absorb brief disconnects (voice reconnects, network blips).
-fn schedule_auto_stop(
+/// Arm the auto-stop timer. If a previous timer is already pending for
+/// this session (e.g. rapid leave/rejoin/leave sequence), abort it first
+/// so we don't accumulate duplicate timers racing each other. The new
+/// handle is stored on the Session so finalization / cleanup can abort
+/// it too.
+async fn schedule_auto_stop(
     ctx: Context,
     state: Arc<AppState>,
     guild_id: GuildId,
     channel_id: ChannelId,
 ) {
-    tokio::spawn(async move {
+    let state_inner = state.clone();
+    let ctx_inner = ctx.clone();
+    let handle = tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
 
-        if channel_humans(&ctx, guild_id, channel_id).is_none_or(|n| n > 0) {
+        if channel_humans(&ctx_inner, guild_id, channel_id).is_none_or(|n| n > 0) {
             return;
         }
 
         info!(guild_id = %guild_id, "auto_stop — channel empty for 30s");
 
-        let manager = songbird::get(&ctx).await.unwrap();
+        let manager = songbird::get(&ctx_inner).await.unwrap();
         if let Some(call) = manager.get(guild_id) {
             let mut handler = call.lock().await;
             let source = songbird::input::File::new("/assets/recording_stopped.wav");
@@ -217,6 +229,17 @@ fn schedule_auto_stop(
         }
 
         let _ = manager.leave(guild_id).await;
-        commands::stop::auto_stop(&ctx, guild_id.get(), &state).await;
+        commands::stop::auto_stop(&ctx_inner, guild_id.get(), &state_inner).await;
     });
+
+    // Replace any existing pending timer; abort the old handle.
+    let mut sessions = state.sessions.lock().await;
+    if let Some(s) = sessions.get_mut(guild_id.get()) {
+        s.abort_auto_stop();
+        s.auto_stop_task = Some(handle);
+    } else {
+        // Session vanished between the outer lock and here — drop the
+        // handle; the timer task will no-op on its check.
+        handle.abort();
+    }
 }

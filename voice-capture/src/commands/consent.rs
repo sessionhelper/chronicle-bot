@@ -545,7 +545,7 @@ async fn cancel_and_abandon(state: &AppState, guild_id: u64, session_id: &str) {
     {
         let mut sessions = state.sessions.lock().await;
         if let Some(s) = sessions.get_mut(guild_id) {
-            s.abort_license_cleanups();
+            s.abort_all_background_tasks();
         }
         sessions.remove(guild_id);
     }

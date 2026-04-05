@@ -95,7 +95,7 @@ async fn stop_pending(state: &AppState, guild_id: u64, session_id: &str) {
     info!(session_id = %session_id, "session_cancelled_pending");
     let mut sessions = state.sessions.lock().await;
     if let Some(s) = sessions.get_mut(guild_id) {
-        s.abort_license_cleanups();
+        s.abort_all_background_tasks();
     }
     sessions.remove(guild_id);
 }
@@ -120,7 +120,7 @@ async fn stop_starting(state: &AppState, guild_id: u64, session_id: &str) {
     info!(session_id = %session_id, "session_cancelled_starting");
     let mut sessions = state.sessions.lock().await;
     if let Some(s) = sessions.get_mut(guild_id) {
-        s.abort_license_cleanups();
+        s.abort_all_background_tasks();
         s.complete();
     }
     sessions.remove(guild_id);
@@ -179,7 +179,7 @@ async fn stop_recording(
 
     let mut sessions = state.sessions.lock().await;
     if let Some(s) = sessions.get_mut(guild_id) {
-        s.abort_license_cleanups();
+        s.abort_all_background_tasks();
         s.complete();
     }
     sessions.remove(guild_id);
