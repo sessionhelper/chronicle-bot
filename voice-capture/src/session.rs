@@ -411,9 +411,21 @@ impl SessionManager {
         Self { sessions: HashMap::new() }
     }
 
-    /// Store a session, keyed by guild ID.
-    pub fn insert(&mut self, session: Session) {
+    /// Atomically reserve a slot for a guild: insert the session if and only
+    /// if there is no existing active session for that guild. Returns `Ok(())`
+    /// on successful reservation, or `Err(session)` handing the session back
+    /// if the slot was already taken.
+    ///
+    /// This is the only supported insertion path. A raw check-then-insert
+    /// sequence was previously racy because the slow work between the two
+    /// (Data API calls, Discord response) released the mutex and let a
+    /// concurrent /record slip through.
+    pub fn try_insert(&mut self, session: Session) -> Result<(), Session> {
+        if self.has_active(session.guild_id) {
+            return Err(session);
+        }
         self.sessions.insert(session.guild_id, session);
+        Ok(())
     }
 
     /// Look up a session by guild ID.
