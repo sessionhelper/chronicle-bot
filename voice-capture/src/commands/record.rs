@@ -267,9 +267,9 @@ pub async fn handle_record(
             sessions.remove(guild_id.get());
             drop(sessions);
             if let Some(sid) = session_uuid
-                && let Err(api_e) = state.api.update_session_state(sid, "abandoned").await
+                && let Err(api_e) = state.api.abandon_session(sid).await
             {
-                error!("API call failed (update_session_state=abandoned): {api_e}");
+                error!("API call failed (abandon_session): {api_e}");
             }
             return Err(e);
         }
