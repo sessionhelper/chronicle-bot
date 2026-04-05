@@ -632,6 +632,16 @@ async fn handle_license_button(
     component: &ComponentInteraction,
     state: &AppState,
 ) -> Result<(), serenity::Error> {
+    // Acknowledge the component interaction immediately — the Data API
+    // round-trips below (toggle_license_flag + get_license_flags) can
+    // exceed Discord's 3-second interaction response window. Acknowledge
+    // is the component equivalent of Defer: no visible "thinking" state,
+    // and we can still edit the original button message via edit_response
+    // once the API calls complete.
+    component
+        .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+        .await?;
+
     let guild_id = component.guild_id.unwrap().get();
     let user_id = component.user.id;
 
@@ -671,20 +681,18 @@ async fn handle_license_button(
     let public_label = if no_public { "No Public Release ✓" } else { "No Public Release" };
 
     component
-        .create_response(
+        .edit_response(
             &ctx.http,
-            CreateInteractionResponse::UpdateMessage(
-                CreateInteractionResponseMessage::new()
-                    .content("Toggle restrictions on your audio:")
-                    .components(vec![CreateActionRow::Buttons(vec![
-                        CreateButton::new("license_no_llm")
-                            .label(llm_label)
-                            .style(llm_style),
-                        CreateButton::new("license_no_public")
-                            .label(public_label)
-                            .style(public_style),
-                    ])]),
-            ),
+            EditInteractionResponse::new()
+                .content("Toggle restrictions on your audio:")
+                .components(vec![CreateActionRow::Buttons(vec![
+                    CreateButton::new("license_no_llm")
+                        .label(llm_label)
+                        .style(llm_style),
+                    CreateButton::new("license_no_public")
+                        .label(public_label)
+                        .style(public_style),
+                ])]),
         )
         .await?;
 
