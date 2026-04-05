@@ -97,14 +97,13 @@ async fn finalize_session(
     info!(session_id = %session_id, "session_finalized");
 
     // Finalize session in Data API
-    if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
-        if let Err(e) = state
+    if let Ok(sid) = uuid::Uuid::parse_str(&session_id)
+        && let Err(e) = state
             .api
             .finalize_session(sid, chrono::Utc::now(), participant_count)
             .await
-        {
-            error!("API call failed (finalize_session): {e}");
-        }
+    {
+        error!("API call failed (finalize_session): {e}");
     }
 
     // Mark session complete and remove from manager
