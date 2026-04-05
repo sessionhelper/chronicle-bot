@@ -115,20 +115,32 @@ pub async fn handle_stop(
 ) -> Result<(), serenity::Error> {
     let guild_id = command.guild_id.unwrap();
 
-    // Verify there's an active recording and the caller is the initiator
+    // Defer IMMEDIATELY — before any lock acquisition or other async work.
+    // Discord's interaction-response window is 3 seconds; deferring extends
+    // it to 15 minutes and lets us take our time on session-lock contention,
+    // audio flushing, S3 uploads, etc.
+    command
+        .create_response(
+            &ctx.http,
+            CreateInteractionResponse::Defer(
+                CreateInteractionResponseMessage::new().ephemeral(true),
+            ),
+        )
+        .await?;
+
+    // Verify there's a session the caller can stop. Accept any non-terminal
+    // phase (AwaitingConsent, Recording, Finalizing) — if a session exists
+    // for this guild, the user should be able to stop it.
     let _session_id = {
         let sessions = state.sessions.lock().await;
         match sessions.get(guild_id.get()) {
-            Some(s) if matches!(s.phase, Phase::Recording { .. }) => {
+            Some(s) if matches!(s.phase, Phase::AwaitingConsent | Phase::Recording { .. } | Phase::Finalizing) => {
                 if s.initiator_id != command.user.id {
                     command
-                        .create_response(
+                        .edit_response(
                             &ctx.http,
-                            CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content("Only the person who started the recording can stop it.")
-                                    .ephemeral(true),
-                            ),
+                            EditInteractionResponse::new()
+                                .content("Only the person who started the recording can stop it."),
                         )
                         .await?;
                     return Ok(());
@@ -137,13 +149,10 @@ pub async fn handle_stop(
             }
             _ => {
                 command
-                    .create_response(
+                    .edit_response(
                         &ctx.http,
-                        CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content("No active recording in this server.")
-                                .ephemeral(true),
-                        ),
+                        EditInteractionResponse::new()
+                            .content("No active recording in this server."),
                     )
                     .await?;
                 return Ok(());
@@ -152,13 +161,9 @@ pub async fn handle_stop(
     };
 
     command
-        .create_response(
+        .edit_response(
             &ctx.http,
-            CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("Wrapping up...")
-                    .ephemeral(true),
-            ),
+            EditInteractionResponse::new().content("Wrapping up..."),
         )
         .await?;
 
