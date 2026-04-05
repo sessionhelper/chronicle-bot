@@ -582,3 +582,251 @@ impl SessionManager {
             .is_some_and(|s| s.phase.is_stoppable())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests — pure logic only (no Songbird Call, no Data API client, no
+// Discord).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serenity::all::UserId;
+
+    fn user(id: u64) -> UserId {
+        UserId::new(id)
+    }
+
+    /// Build a test session with three pending participants.
+    fn session_with_three_participants(min: usize, require_all: bool) -> Session {
+        let mut s = Session::new(
+            /* guild_id */ 111,
+            /* channel_id */ 222,
+            /* text_channel_id */ 333,
+            user(1),
+            min,
+            require_all,
+        );
+        s.add_participant(user(1), "alice".into(), false);
+        s.add_participant(user(2), "bob".into(), false);
+        s.add_participant(user(3), "carol".into(), false);
+        s
+    }
+
+    // --- Phase state ---
+
+    #[test]
+    fn phase_is_stoppable_for_non_terminal_states() {
+        let s = session_with_three_participants(2, true);
+        assert!(s.phase.is_stoppable()); // AwaitingConsent
+    }
+
+    #[test]
+    fn phase_is_terminal_for_finalized_states() {
+        assert!(Phase::Finalizing.is_terminal());
+        assert!(Phase::Cancelled.is_terminal());
+        assert!(Phase::Complete.is_terminal());
+    }
+
+    #[test]
+    fn phase_is_not_stoppable_for_terminal_states() {
+        assert!(!Phase::Finalizing.is_stoppable());
+        assert!(!Phase::Cancelled.is_stoppable());
+        assert!(!Phase::Complete.is_stoppable());
+    }
+
+    // --- add_participant / record_consent ---
+
+    #[test]
+    fn add_participant_is_idempotent() {
+        let mut s = session_with_three_participants(2, true);
+        let before = s.participants.len();
+        s.add_participant(user(1), "alice renamed".into(), false);
+        assert_eq!(s.participants.len(), before);
+        // First write wins — subsequent adds don't overwrite.
+        assert_eq!(s.participants[&user(1)].display_name, "alice");
+    }
+
+    #[test]
+    fn record_consent_sets_scope_and_timestamp() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        let p = &s.participants[&user(1)];
+        assert_eq!(p.scope, Some(ConsentScope::Full));
+        assert!(p.consented_at.is_some());
+    }
+
+    #[test]
+    fn record_consent_ignores_unknown_user() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(999), ConsentScope::Full);
+        // No panic, no new participant.
+        assert_eq!(s.participants.len(), 3);
+    }
+
+    // --- Response tracking ---
+
+    #[test]
+    fn all_responded_false_when_some_pending() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        assert!(!s.all_responded());
+    }
+
+    #[test]
+    fn all_responded_true_when_every_participant_replied() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Decline);
+        assert!(s.all_responded());
+    }
+
+    #[test]
+    fn has_decline_flags_any_decliner() {
+        let mut s = session_with_three_participants(2, true);
+        assert!(!s.has_decline());
+        s.record_consent(user(1), ConsentScope::Full);
+        assert!(!s.has_decline());
+        s.record_consent(user(2), ConsentScope::Decline);
+        assert!(s.has_decline());
+    }
+
+    #[test]
+    fn consented_user_ids_lists_only_full_scope() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Decline);
+        s.record_consent(user(3), ConsentScope::Full);
+        let ids = s.consented_user_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&user(1)));
+        assert!(ids.contains(&user(3)));
+    }
+
+    // --- Quorum evaluation ---
+
+    #[test]
+    fn quorum_passes_when_min_accepts_and_no_decline() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Full);
+        assert!(s.evaluate_quorum());
+    }
+
+    #[test]
+    fn quorum_fails_when_require_all_and_someone_declines() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Decline);
+        assert!(!s.evaluate_quorum());
+    }
+
+    #[test]
+    fn quorum_passes_when_not_require_all_and_min_met() {
+        let mut s = session_with_three_participants(2, false);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Decline);
+        assert!(s.evaluate_quorum());
+    }
+
+    #[test]
+    fn quorum_fails_when_below_min_even_without_declines() {
+        let mut s = session_with_three_participants(3, false);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        assert!(!s.evaluate_quorum());
+    }
+
+    // --- Metadata serialization ---
+
+    #[test]
+    fn meta_json_round_trips_to_valid_json() {
+        let s = session_with_three_participants(2, true);
+        let bytes = s.meta_json();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["session_id"], s.id);
+        assert_eq!(parsed["participant_count"], 3);
+        assert_eq!(parsed["audio_format"]["sample_rate"], 48000);
+        assert_eq!(parsed["audio_format"]["bit_depth"], 16);
+    }
+
+    #[test]
+    fn consent_json_includes_every_participant_keyed_by_pseudo() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Decline);
+        let bytes = s.consent_json();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["license"], "CC BY-SA 4.0");
+        let participants = parsed["participants"].as_object().unwrap();
+        assert_eq!(participants.len(), 3);
+        // Every key is a 16-char hex pseudonym
+        for k in participants.keys() {
+            assert_eq!(k.len(), 16);
+            assert!(k.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn meta_json_audio_count_reflects_full_consent_only() {
+        let mut s = session_with_three_participants(2, true);
+        s.record_consent(user(1), ConsentScope::Full);
+        s.record_consent(user(2), ConsentScope::Full);
+        s.record_consent(user(3), ConsentScope::Decline);
+        let bytes = s.meta_json();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["consented_audio_count"], 2);
+        assert_eq!(parsed["participant_count"], 3);
+    }
+
+    // --- SessionManager atomicity ---
+    //
+    // Session isn't Debug (carries non-Debug songbird/tokio handles), so
+    // `.unwrap()` / `.unwrap_err()` on try_insert's Result<(), Box<Session>>
+    // won't compile. We use an explicit `if is_err { panic }` helper and
+    // match for the Err-inspecting test.
+
+    fn try_insert_or_panic(mgr: &mut SessionManager, s: Session) {
+        if mgr.try_insert(s).is_err() {
+            panic!("try_insert failed unexpectedly");
+        }
+    }
+
+    #[test]
+    fn session_manager_try_insert_ok_when_empty() {
+        let mut mgr = SessionManager::new();
+        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
+        assert!(mgr.has_active(111));
+    }
+
+    #[test]
+    fn session_manager_try_insert_rejects_duplicate_guild() {
+        let mut mgr = SessionManager::new();
+        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
+        let second = session_with_three_participants(2, true);
+        let second_id = second.id.clone();
+        match mgr.try_insert(second) {
+            Err(rejected) => assert_eq!(rejected.id, second_id),
+            Ok(()) => panic!("expected try_insert to reject duplicate guild"),
+        }
+    }
+
+    #[test]
+    fn session_manager_try_insert_ok_after_remove() {
+        let mut mgr = SessionManager::new();
+        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
+        mgr.remove(111);
+        assert!(!mgr.has_active(111));
+        try_insert_or_panic(&mut mgr, session_with_three_participants(2, true));
+    }
+
+    #[test]
+    fn session_manager_has_active_false_for_empty() {
+        let mgr = SessionManager::new();
+        assert!(!mgr.has_active(111));
+    }
+}
