@@ -173,6 +173,30 @@ impl AudioReceiver {
 impl VoiceEventHandler for AudioReceiver {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(VoiceTick { speaking, .. }) = ctx {
+            // --- DIAGNOSTIC: log raw VoiceTick shape during startup ---
+            // This runs on EVERY tick (~20ms), so only emit at debug level.
+            // Turn on via RUST_LOG=ttrpg_collector::voice::receiver=debug
+            // to see whether songbird is delivering ticks at all during
+            // the DAVE wait window.
+            if !speaking.is_empty() {
+                let ssrc_map = self.ssrc_to_user.lock().expect("ssrc_map poisoned");
+                let mapped_count = speaking
+                    .keys()
+                    .filter(|ssrc| ssrc_map.contains_key(*ssrc))
+                    .count();
+                let decoded_count = speaking
+                    .values()
+                    .filter(|d| d.decoded_voice.is_some())
+                    .count();
+                tracing::debug!(
+                    total_ssrcs = speaking.len(),
+                    mapped = mapped_count,
+                    decoded = decoded_count,
+                    "voice_tick_diagnostic"
+                );
+                drop(ssrc_map);
+            }
+
             // Acquire the tokio mutex (async) first so the std mutex guard
             // never needs to cross an await point — std MutexGuard is !Send.
             let consented = self.consented_users.lock().await;
@@ -329,14 +353,25 @@ struct SpeakingTracker {
 #[async_trait]
 impl VoiceEventHandler for SpeakingTracker {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::SpeakingStateUpdate(speaking) = ctx
-            && let Some(uid) = speaking.user_id
-        {
-            let mut map = self.ssrc_to_user.lock().expect("ssrc_map poisoned");
-            if !map.contains_key(&speaking.ssrc) {
-                info!(ssrc = speaking.ssrc, user_id = %uid, "ssrc_mapped");
+        if let EventContext::SpeakingStateUpdate(speaking) = ctx {
+            // --- DIAGNOSTIC: log ALL SpeakingStateUpdate events, including
+            // those with user_id=None. This tells us whether Discord is
+            // sending OP5 at all during the DAVE handshake window. ---
+            match speaking.user_id {
+                Some(uid) => {
+                    let mut map = self.ssrc_to_user.lock().expect("ssrc_map poisoned");
+                    if !map.contains_key(&speaking.ssrc) {
+                        info!(ssrc = speaking.ssrc, user_id = %uid, "ssrc_mapped");
+                    }
+                    map.insert(speaking.ssrc, uid.0);
+                }
+                None => {
+                    tracing::debug!(
+                        ssrc = speaking.ssrc,
+                        "speaking_state_update_without_user_id — OP5 received but no uid"
+                    );
+                }
             }
-            map.insert(speaking.ssrc, uid.0);
         }
         None
     }
