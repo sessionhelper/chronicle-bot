@@ -149,6 +149,11 @@ pub struct Session {
     pub license_followups: Vec<(String, MessageId)>,
     pub license_cleanup_tasks: Vec<JoinHandle<()>>,
 
+    /// Pending auto-stop timer task, if any. Set when the voice channel
+    /// becomes empty; aborted on rejoin (rapid leave/rejoin churn) or on
+    /// finalization. At most one pending timer per session at a time.
+    pub auto_stop_task: Option<JoinHandle<()>>,
+
     // Audio config
     pub audio_received: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -179,7 +184,16 @@ impl Session {
             consent_message: None,
             license_followups: Vec::new(),
             license_cleanup_tasks: Vec::new(),
+            auto_stop_task: None,
             audio_received: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Abort a pending auto-stop timer if any. Called when the channel
+    /// re-fills (rapid leave/rejoin) and during finalization.
+    pub fn abort_auto_stop(&mut self) {
+        if let Some(h) = self.auto_stop_task.take() {
+            h.abort();
         }
     }
 
@@ -363,6 +377,14 @@ impl Session {
         for handle in self.license_cleanup_tasks.drain(..) {
             handle.abort();
         }
+    }
+
+    /// Abort all background tasks owned by this session: license cleanup
+    /// followups and the auto-stop timer. Called during every terminal
+    /// transition.
+    pub fn abort_all_background_tasks(&mut self) {
+        self.abort_license_cleanups();
+        self.abort_auto_stop();
     }
 
 
