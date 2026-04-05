@@ -137,6 +137,20 @@ pub enum ApiError {
     Status { status: u16, body: String },
 }
 
+/// Convert a reqwest response into an `ApiError::Status` if its HTTP status
+/// is not a success code. Returns the response unchanged on success so you
+/// can chain `.json()` / `.bytes()` / etc. Removes ~12 copies of the same
+/// if-!is_success block from the client methods below.
+async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, ApiError> {
+    if resp.status().is_success() {
+        Ok(resp)
+    } else {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Err(ApiError::Status { status, body })
+    }
+}
+
 impl DataApiClient {
     /// Authenticate with the Data API using a shared secret.
     /// Returns a client ready to make authenticated requests.
@@ -156,13 +170,7 @@ impl DataApiClient {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
-        let auth: AuthResponse = resp.json().await?;
+        let auth: AuthResponse = check_status(resp).await?.json().await?;
 
         Ok(Self {
             client,
@@ -185,13 +193,7 @@ impl DataApiClient {
             .header("authorization", self.auth_header())
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
+        check_status(resp).await?;
         Ok(())
     }
 
@@ -221,14 +223,7 @@ impl DataApiClient {
             })
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
-        Ok(resp.json().await?)
+        Ok(check_status(resp).await?.json().await?)
     }
 
     /// Update session status (replaces db::update_session_state).
@@ -248,14 +243,7 @@ impl DataApiClient {
             })
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status_code = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status: status_code, body });
-        }
-
-        Ok(resp.json().await?)
+        Ok(check_status(resp).await?.json().await?)
     }
 
     /// Finalize a session: set ended_at, participant_count, and status=complete
@@ -277,91 +265,70 @@ impl DataApiClient {
             })
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
-        Ok(resp.json().await?)
+        Ok(check_status(resp).await?.json().await?)
     }
 
     // --- Users ---
 
-    /// Upsert a user and check if they're on the blocklist (replaces db::check_blocklist).
-    /// Returns true if the user has opted out globally.
-    pub async fn check_blocklist(&self, discord_user_id: u64) -> Result<bool, ApiError> {
+    /// Upsert a user row for a discord_user_id and return the UserResponse.
+    /// Private helper — centralizes the "pseudonymize → POST /internal/users"
+    /// dance that four public methods were previously open-coding.
+    async fn upsert_user(&self, discord_user_id: u64) -> Result<UserResponse, ApiError> {
         let pseudo_id = pseudonymize(discord_user_id);
-
-        // First ensure user exists
-        let _ = self
+        let resp = self
             .client
             .post(format!("{}/internal/users", self.base_url))
             .header("authorization", self.auth_header())
             .json(&CreateUserRequest {
                 discord_id_hash: pseudo_id.clone(),
-                pseudo_id: pseudo_id.clone(),
+                pseudo_id,
             })
             .send()
             .await?;
+        Ok(check_status(resp).await?.json().await?)
+    }
 
-        // Then check opt-out status
-        let resp = self
-            .client
-            .get(format!("{}/internal/users/{}", self.base_url, pseudo_id))
-            .header("authorization", self.auth_header())
-            .send()
-            .await?;
+    /// Look up a participant row by (session_id, discord_user_id). This is
+    /// the client-side join the Data API forces us into: resolve discord →
+    /// user UUID, list all participants for the session, find the match.
+    /// Three public methods (record_consent, toggle_license_flag,
+    /// get_license_flags) previously duplicated this logic.
+    ///
+    /// Future: push this into a dedicated Data API endpoint so we do one
+    /// round-trip instead of two.
+    async fn find_participant(
+        &self,
+        session_id: Uuid,
+        discord_user_id: u64,
+    ) -> Result<ParticipantResponse, ApiError> {
+        let user = self.upsert_user(discord_user_id).await?;
+        let participants = self.list_participants(session_id).await?;
+        participants
+            .into_iter()
+            .find(|p| p.user_id == Some(user.id))
+            .ok_or_else(|| ApiError::Status {
+                status: 404,
+                body: "participant not found for user".to_string(),
+            })
+    }
 
-        if resp.status().as_u16() == 404 {
-            // User not found = not blocked
-            return Ok(false);
-        }
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
-        let user: UserResponse = resp.json().await?;
+    /// Upsert a user and check if they're on the blocklist (replaces db::check_blocklist).
+    /// Returns true if the user has opted out globally.
+    pub async fn check_blocklist(&self, discord_user_id: u64) -> Result<bool, ApiError> {
+        let user = self.upsert_user(discord_user_id).await?;
         Ok(user.global_opt_out)
     }
 
     // --- Participants ---
 
-    /// Add a participant to a session (replaces db::add_participant).
-    /// Also upserts the user first.
+    /// Add a participant to a session.
     pub async fn add_participant(
         &self,
         session_id: Uuid,
         discord_user_id: u64,
         mid_session_join: bool,
     ) -> Result<ParticipantResponse, ApiError> {
-        let pseudo_id = pseudonymize(discord_user_id);
-
-        // Upsert user first to get user UUID
-        let user_resp = self
-            .client
-            .post(format!("{}/internal/users", self.base_url))
-            .header("authorization", self.auth_header())
-            .json(&CreateUserRequest {
-                discord_id_hash: pseudo_id.clone(),
-                pseudo_id: pseudo_id.clone(),
-            })
-            .send()
-            .await?;
-
-        if !user_resp.status().is_success() {
-            let status = user_resp.status().as_u16();
-            let body = user_resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
-        let user: UserResponse = user_resp.json().await?;
-
-        // Add participant with user_id
+        let user = self.upsert_user(discord_user_id).await?;
         let resp = self
             .client
             .post(format!(
@@ -375,52 +342,18 @@ impl DataApiClient {
             })
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
-        Ok(resp.json().await?)
+        Ok(check_status(resp).await?.json().await?)
     }
 
-    /// Record consent for a participant (replaces db::record_consent).
-    /// Looks up the participant by session + user, then patches consent.
+    /// Record consent for a participant: resolve them via find_participant
+    /// and PATCH their consent row.
     pub async fn record_consent(
         &self,
         session_id: Uuid,
         discord_user_id: u64,
         scope: &str,
     ) -> Result<(), ApiError> {
-        let pseudo_id = pseudonymize(discord_user_id);
-
-        // Get user UUID
-        let user_resp = self
-            .client
-            .get(format!("{}/internal/users/{}", self.base_url, pseudo_id))
-            .header("authorization", self.auth_header())
-            .send()
-            .await?;
-
-        if !user_resp.status().is_success() {
-            let status = user_resp.status().as_u16();
-            let body = user_resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-        let user: UserResponse = user_resp.json().await?;
-
-        // List participants to find this user's participant row
-        let participants = self.list_participants(session_id).await?;
-        let participant = participants
-            .iter()
-            .find(|p| p.user_id == Some(user.id))
-            .ok_or_else(|| ApiError::Status {
-                status: 404,
-                body: "participant not found for user".to_string(),
-            })?;
-
-        // Patch consent
+        let participant = self.find_participant(session_id, discord_user_id).await?;
         let resp = self
             .client
             .patch(format!(
@@ -434,55 +367,23 @@ impl DataApiClient {
             })
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
+        check_status(resp).await?;
         Ok(())
     }
 
-    /// Toggle a license flag (replaces db::toggle_license_flag).
+    /// Toggle a license flag (no_llm_training or no_public_release).
     pub async fn toggle_license_flag(
         &self,
         session_id: Uuid,
         discord_user_id: u64,
         field: &str,
     ) -> Result<(), ApiError> {
-        let pseudo_id = pseudonymize(discord_user_id);
-
-        let user_resp = self
-            .client
-            .get(format!("{}/internal/users/{}", self.base_url, pseudo_id))
-            .header("authorization", self.auth_header())
-            .send()
-            .await?;
-
-        if !user_resp.status().is_success() {
-            let status = user_resp.status().as_u16();
-            let body = user_resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-        let user: UserResponse = user_resp.json().await?;
-
-        let participants = self.list_participants(session_id).await?;
-        let participant = participants
-            .iter()
-            .find(|p| p.user_id == Some(user.id))
-            .ok_or_else(|| ApiError::Status {
-                status: 404,
-                body: "participant not found for user".to_string(),
-            })?;
-
-        // Toggle: read current value, flip it
+        let participant = self.find_participant(session_id, discord_user_id).await?;
         let (no_llm, no_public) = match field {
             "no_llm_training" => (Some(!participant.no_llm_training), None),
             "no_public_release" => (None, Some(!participant.no_public_release)),
             _ => return Ok(()),
         };
-
         let resp = self
             .client
             .patch(format!(
@@ -496,44 +397,22 @@ impl DataApiClient {
             })
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
+        check_status(resp).await?;
         Ok(())
     }
 
-    /// Get license flags for a participant (replaces db::get_license_flags).
+    /// Get license flags for a participant. Returns (false, false) when the
+    /// participant can't be resolved — this is a "display state" helper
+    /// called from a button click; absence shouldn't be an error.
     pub async fn get_license_flags(
         &self,
         session_id: Uuid,
         discord_user_id: u64,
     ) -> Result<(bool, bool), ApiError> {
-        let pseudo_id = pseudonymize(discord_user_id);
-
-        let user_resp = self
-            .client
-            .get(format!("{}/internal/users/{}", self.base_url, pseudo_id))
-            .header("authorization", self.auth_header())
-            .send()
-            .await?;
-
-        if !user_resp.status().is_success() {
-            return Ok((false, false));
-        }
-        let user: UserResponse = user_resp.json().await?;
-
-        let participants = self.list_participants(session_id).await?;
-        let participant = participants
-            .iter()
-            .find(|p| p.user_id == Some(user.id));
-
-        match participant {
-            Some(p) => Ok((p.no_llm_training, p.no_public_release)),
-            None => Ok((false, false)),
+        match self.find_participant(session_id, discord_user_id).await {
+            Ok(p) => Ok((p.no_llm_training, p.no_public_release)),
+            Err(ApiError::Status { status: 404, .. }) => Ok((false, false)),
+            Err(e) => Err(e),
         }
     }
 
@@ -551,14 +430,7 @@ impl DataApiClient {
             .header("authorization", self.auth_header())
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
-        Ok(resp.json().await?)
+        Ok(check_status(resp).await?.json().await?)
     }
 
     // --- Audio ---
@@ -613,8 +485,7 @@ impl DataApiClient {
 
     // --- Metadata ---
 
-    /// Upload session metadata (meta.json + consent.json) to the Data API
-    /// (replaces s3.upload_bytes for metadata files).
+    /// Upload session metadata (meta.json + consent.json) to the Data API.
     pub async fn write_metadata(
         &self,
         session_id: Uuid,
@@ -639,13 +510,7 @@ impl DataApiClient {
             .json(&body)
             .send()
             .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(ApiError::Status { status, body });
-        }
-
+        check_status(resp).await?;
         Ok(())
     }
 }
