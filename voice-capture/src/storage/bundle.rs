@@ -9,15 +9,9 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// What a participant chose when presented with the consent prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConsentScope {
-    /// Participant consented to full audio capture and release.
-    Full,
-    /// Participant declined all recording.
-    Decline,
-}
+// ConsentScope lives in the session module — it is session-domain data.
+// Re-imported here for the serialization structs below.
+use crate::session::ConsentScope;
 
 /// Derive a pseudonymous identifier from a Discord user ID.
 /// Uses SHA-256 truncated to 16 hex chars (8 bytes) for privacy.

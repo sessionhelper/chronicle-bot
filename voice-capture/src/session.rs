@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 use serenity::all::{ChannelId, MessageId, UserId};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -20,8 +21,18 @@ use crate::storage::bundle::{
     SessionMeta, AudioFormat, ParticipantMeta, ConsentRecord, ConsentEntry,
 };
 
-// Re-export ConsentScope so callers can use session::ConsentScope
-pub use crate::storage::bundle::ConsentScope;
+/// What a participant chose when presented with the consent prompt.
+/// This is session-domain data; the serde derive is here so it can be
+/// embedded directly in the JSON payloads that ship to S3 via meta.json
+/// and consent.json.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsentScope {
+    /// Participant consented to full audio capture and release.
+    Full,
+    /// Participant declined all recording.
+    Decline,
+}
 
 /// Per-participant consent record, tracking who they are and what they chose.
 #[derive(Debug, Clone)]

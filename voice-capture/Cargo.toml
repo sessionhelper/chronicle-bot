@@ -3,10 +3,6 @@ name = "ttrpg-collector"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-name = "ttrpg_collector"
-path = "src/lib.rs"
-
 [[bin]]
 name = "ttrpg-collector"
 path = "src/main.rs"
