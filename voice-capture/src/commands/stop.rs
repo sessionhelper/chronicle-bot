@@ -28,60 +28,132 @@ async fn cleanup_session_ui(ctx: &Context, session: &Session) {
     }
 }
 
-/// Flush remaining audio buffers and upload metadata via the Data API.
-/// Transitions the session through Finalizing -> uploading metadata.
-/// Shared by both /stop and auto-stop.
+/// Action to take when stopping a session, dispatched on current phase.
+enum StopAction {
+    /// Phase::Recording — flush audio, upload metadata, mark complete
+    Finalize,
+    /// Phase::StartingRecording — shut down pipeline, mark abandoned (no
+    /// metadata to upload, no audio chunks to flush)
+    CancelStartup,
+    /// Phase::AwaitingConsent — no pipeline to tear down, just mark
+    /// abandoned in the Data API and remove
+    RemovePending,
+    /// Already terminal or session gone — no-op
+    NoOp,
+}
+
+/// Stop a session by dispatching on its current phase.
+///
+/// This is the only correct path for /stop and auto_stop. It replaces the
+/// old finalize_session that unconditionally ran the full metadata-upload
+/// path regardless of whether the session had actually recorded anything —
+/// an assumption that was wrong for StartingRecording and AwaitingConsent,
+/// and manifested as: orphan Data API rows, double-decrement of the
+/// sessions_active gauge, and metadata uploads with zero audio.
 #[tracing::instrument(skip_all, fields(guild_id = guild_id))]
 async fn finalize_session(
     _ctx: &Context,
     state: &AppState,
     guild_id: u64,
 ) {
-    // Signal any in-progress startup pipeline (voice join, DAVE wait,
-    // recording_started follow-ups) to bail out cooperatively. The flag
-    // is on a per-Session Arc so even if we remove the session from the
-    // map below, the pipeline task still sees the cancellation via its
-    // captured clone.
-    {
-        let sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get(guild_id) {
-            session
-                .startup_cancelled
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
-    // Finalize: shut down audio pipeline, set ended_at
-    {
-        let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(guild_id) {
-            session.finalize().await;
-        }
-    }
-
-    // Upload meta.json and consent.json via Data API (read-only lock on session data)
-    let (meta_json, consent_json, session_id, participant_count) = {
+    // Snapshot phase + identity under one lock, then release before any
+    // network work.
+    let (action, session_id, participant_count) = {
         let sessions = state.sessions.lock().await;
         match sessions.get(guild_id) {
-            Some(session) => {
-                (
-                    session.meta_json(),
-                    session.consent_json(),
-                    session.id.clone(),
-                    session.participants.len() as i32,
-                )
+            Some(s) => {
+                let action = match &s.phase {
+                    Phase::Recording(_) => StopAction::Finalize,
+                    Phase::StartingRecording(_) => StopAction::CancelStartup,
+                    Phase::AwaitingConsent => StopAction::RemovePending,
+                    _ => StopAction::NoOp,
+                };
+                (action, s.id.clone(), s.participants.len() as i32)
             }
             None => return,
         }
     };
 
-    // Parse metadata bytes into JSON values for the API
-    let meta_value: Option<serde_json::Value> =
-        serde_json::from_slice(&meta_json).ok();
-    let consent_value: Option<serde_json::Value> =
-        serde_json::from_slice(&consent_json).ok();
+    match action {
+        StopAction::NoOp => {}
+        StopAction::RemovePending => stop_pending(state, guild_id, &session_id).await,
+        StopAction::CancelStartup => stop_starting(state, guild_id, &session_id).await,
+        StopAction::Finalize => {
+            stop_recording(state, guild_id, &session_id, participant_count).await
+        }
+    }
+}
 
-    if let Ok(sid) = uuid::Uuid::parse_str(&session_id) {
+/// Stop path for Phase::AwaitingConsent: no pipeline running yet, just mark
+/// the Data API session row abandoned and drop the local state.
+async fn stop_pending(state: &AppState, guild_id: u64, session_id: &str) {
+    if let Ok(sid) = uuid::Uuid::parse_str(session_id)
+        && let Err(e) = state.api.update_session_state(sid, "abandoned").await
+    {
+        error!("API call failed (update_session_state=abandoned): {e}");
+    }
+    info!(session_id = %session_id, "session_cancelled_pending");
+    let mut sessions = state.sessions.lock().await;
+    if let Some(s) = sessions.get_mut(guild_id) {
+        s.abort_license_cleanups();
+    }
+    sessions.remove(guild_id);
+}
+
+/// Stop path for Phase::StartingRecording: audio pipeline is spun up but
+/// DAVE never confirmed, so there is nothing to upload. Drain and shut down
+/// the pipeline, mark the session abandoned in the Data API, remove.
+async fn stop_starting(state: &AppState, guild_id: u64, session_id: &str) {
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(guild_id) {
+            s.cancel_startup().await;
+        }
+    }
+
+    if let Ok(sid) = uuid::Uuid::parse_str(session_id)
+        && let Err(e) = state.api.update_session_state(sid, "abandoned").await
+    {
+        error!("API call failed (update_session_state=abandoned): {e}");
+    }
+
+    info!(session_id = %session_id, "session_cancelled_starting");
+    let mut sessions = state.sessions.lock().await;
+    if let Some(s) = sessions.get_mut(guild_id) {
+        s.abort_license_cleanups();
+        s.complete();
+    }
+    sessions.remove(guild_id);
+}
+
+/// Stop path for Phase::Recording: the full "normal /stop" flow. Flush audio
+/// buffers, upload meta.json + consent.json, mark status=complete in the
+/// Data API, remove.
+async fn stop_recording(
+    state: &AppState,
+    guild_id: u64,
+    session_id: &str,
+    participant_count: i32,
+) {
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(guild_id) {
+            s.finalize().await;
+        }
+    }
+
+    let (meta_json, consent_json) = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(guild_id) {
+            Some(s) => (s.meta_json(), s.consent_json()),
+            None => return,
+        }
+    };
+
+    let meta_value: Option<serde_json::Value> = serde_json::from_slice(&meta_json).ok();
+    let consent_value: Option<serde_json::Value> = serde_json::from_slice(&consent_json).ok();
+
+    if let Ok(sid) = uuid::Uuid::parse_str(session_id) {
         match state.api.write_metadata(sid, meta_value, consent_value).await {
             Ok(_) => {
                 metrics::counter!("ttrpg_uploads_total", "type" => "metadata", "outcome" => "success").increment(1);
@@ -96,8 +168,7 @@ async fn finalize_session(
     metrics::gauge!("ttrpg_sessions_active").decrement(1.0);
     info!(session_id = %session_id, "session_finalized");
 
-    // Finalize session in Data API
-    if let Ok(sid) = uuid::Uuid::parse_str(&session_id)
+    if let Ok(sid) = uuid::Uuid::parse_str(session_id)
         && let Err(e) = state
             .api
             .finalize_session(sid, chrono::Utc::now(), participant_count)
@@ -106,15 +177,12 @@ async fn finalize_session(
         error!("API call failed (finalize_session): {e}");
     }
 
-    // Mark session complete and remove from manager
-    {
-        let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(guild_id) {
-            session.abort_license_cleanups();
-            session.complete();
-        }
-        sessions.remove(guild_id);
+    let mut sessions = state.sessions.lock().await;
+    if let Some(s) = sessions.get_mut(guild_id) {
+        s.abort_license_cleanups();
+        s.complete();
     }
+    sessions.remove(guild_id);
 }
 
 /// Handle the /stop slash command.
@@ -141,13 +209,13 @@ pub async fn handle_stop(
         )
         .await?;
 
-    // Verify there's a session the caller can stop. Accept any non-terminal
-    // phase (AwaitingConsent, Recording, Finalizing) — if a session exists
-    // for this guild, the user should be able to stop it.
+    // Verify there's a stoppable session for this guild. is_stoppable
+    // matches AwaitingConsent | StartingRecording | Recording — the three
+    // phases where the user might visibly expect /stop to do something.
     let _session_id = {
         let sessions = state.sessions.lock().await;
         match sessions.get(guild_id.get()) {
-            Some(s) if matches!(s.phase, Phase::AwaitingConsent | Phase::Recording { .. } | Phase::Finalizing) => {
+            Some(s) if s.phase.is_stoppable() => {
                 if s.initiator_id != command.user.id {
                     command
                         .edit_response(
