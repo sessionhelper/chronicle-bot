@@ -383,9 +383,9 @@ pub(crate) async fn start_recording_headless(
     }
     transition_to_recording(state, guild_id, &session_id).await;
 
-    play_start_announcement(&manager, guild_id_obj).await;
-    // NB: no embed update, no license followup — there's no consent
-    // message in the harness path and no human to send a followup to.
+    // Don't play the start announcement yet — the DAVE heal task will
+    // play it once the initial check passes or heal completes. This is
+    // the contract: announcement = recording is stable, players can talk.
     if let Ok(sid) = uuid::Uuid::parse_str(&session_id)
         && let Err(e) = state.api.update_session_state(sid, "recording").await
     {
@@ -396,8 +396,7 @@ pub(crate) async fn start_recording_headless(
     info!(session_id = %session_id, "recording_started (headless)");
 
     // Spawn DAVE heal monitor — runs for the lifetime of the session.
-    // Checks after 5s grace period, then monitors OP5 continuously.
-    // Sets recording_stable once the initial check passes or heal completes.
+    // Plays the start announcement once stable.
     spawn_dave_heal_task(
         state.sessions.clone(),
         &manager,
@@ -496,7 +495,8 @@ async fn start_recording_pipeline(
     }
     transition_to_recording(state, guild_id, &session_id).await;
 
-    play_start_announcement(&manager, guild_id_obj).await;
+    // Don't play the start announcement yet — the DAVE heal task will
+    // play it once the initial check passes or heal completes.
     update_consent_embed_to_recording(ctx, state, guild_id).await;
     if let Ok(sid) = uuid::Uuid::parse_str(&session_id)
         && let Err(e) = state.api.update_session_state(sid, "recording").await
@@ -507,8 +507,7 @@ async fn start_recording_pipeline(
     metrics::gauge!("ttrpg_sessions_active").increment(1.0);
     info!(session_id = %session_id, "recording_started");
 
-    // Spawn DAVE heal monitor — checks after 5s grace period whether
-    // every consented speaker has audio, reconnects once if not.
+    // Spawn DAVE heal monitor — plays the start announcement once stable.
     spawn_dave_heal_task(
         state.sessions.clone(),
         &manager,
@@ -956,7 +955,13 @@ fn spawn_dave_heal_task(
             ).await;
         }
 
-        // Signal stable — either check passed or heal completed/failed
+        // Signal stable — either check passed or heal completed/failed.
+        // Play the start announcement NOW. This is the contract: the
+        // announcement means "recording is stable, you can talk."
+        if !healed {
+            // If we healed, do_heal already played the announcement.
+            play_start_announcement(&heal_manager, guild_id_obj).await;
+        }
         stable_flag.store(true, std::sync::atomic::Ordering::Relaxed);
         info!(session_id = %session_id, healed, "recording_stable");
 
