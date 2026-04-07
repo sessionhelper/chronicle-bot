@@ -395,8 +395,9 @@ pub(crate) async fn start_recording_headless(
     metrics::gauge!("ttrpg_sessions_active").increment(1.0);
     info!(session_id = %session_id, "recording_started (headless)");
 
-    // Spawn DAVE heal monitor — checks after 5s grace period whether
-    // every consented speaker has audio, reconnects once if not.
+    // Spawn DAVE heal monitor — runs for the lifetime of the session.
+    // Checks after 5s grace period, then monitors OP5 continuously.
+    // Sets recording_stable once the initial check passes or heal completes.
     spawn_dave_heal_task(
         state.sessions.clone(),
         &manager,
@@ -811,21 +812,19 @@ async fn send_license_followup(
 // DAVE heal: detect speakers with broken decryptors and reconnect once
 // ---------------------------------------------------------------------------
 
-/// Spawn a one-shot background task that detects broken DAVE decryptors
-/// using OP5-triggered detection (R2).
+/// Spawn a DAVE health monitor that runs for the lifetime of the session.
 ///
-/// When Discord's voice server fires SpeakingStateUpdate (OP5) for a user,
-/// it means RTP packets are arriving from that user. If the SSRC doesn't
-/// appear in VoiceTick within 2 seconds, DAVE decryption is broken for
-/// that speaker. The task then leaves and rejoins voice to get a fresh
-/// MLS Welcome.
+/// **Initial check (startup):** After a 5s grace period, checks whether
+/// consented speakers are healthy via OP5 + SSRC presence + fallback.
+/// If broken, performs a one-shot heal (leave → rejoin). Sets the
+/// `recording_stable` flag once the check passes or heal completes.
 ///
-/// Muted/PTT users never trigger OP5 (no RTP = no OP5), so they can't
-/// cause false heals. Hardware-muted users send silence frames, which
-/// DO trigger OP5 and DO appear in VoiceTick — also correct.
+/// **Continuous monitoring:** After the initial check, keeps consuming
+/// OP5 events. If at any point during the session an OP5 fires and the
+/// SSRC doesn't appear in VoiceTick within 2s, triggers a heal. The
+/// heal is still one-shot — only one reconnect per session.
 ///
-/// Runs AT MOST ONCE per session. If the reconnect doesn't fix it,
-/// the loss is logged and accepted.
+/// Exits when the `op5_rx` channel closes (session finalized).
 fn spawn_dave_heal_task(
     sessions: Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
     manager: &Arc<songbird::Songbird>,
@@ -838,19 +837,20 @@ fn spawn_dave_heal_task(
     let heal_manager = manager.clone();
 
     tokio::spawn(async move {
-        // Take the op5_rx from the session — this heal task owns it.
-        let (mut op5_rx, ssrcs_seen, ssrc_map, consented_count) = {
+        // Take the op5_rx and shared state from the session.
+        let (mut op5_rx, ssrcs_seen, ssrc_map, consented_count, stable_flag) = {
             let mut sessions = heal_sessions.lock().await;
             let Some(s) = sessions.get_mut(guild_id) else {
                 return;
             };
+            let stable = s.recording_stable.clone();
             match &mut s.phase {
                 Phase::Recording(data) | Phase::StartingRecording(data) => {
                     let rx = data.op5_rx.take();
                     let seen = data.ssrcs_seen.clone();
                     let map = data.ssrc_map.clone();
                     let count = data.consented_users.lock().await.len();
-                    (rx, seen, map, count)
+                    (rx, seen, map, count, stable)
                 }
                 _ => return,
             }
@@ -861,17 +861,14 @@ fn spawn_dave_heal_task(
             return;
         };
 
-        // Initial grace period: let MLS group stabilize after collector joins.
-        // OP5 events that arrive during this window are buffered in the channel.
+        let mut healed = false;
+
+        // --- Initial startup check ---
+        // Grace period: let MLS group stabilize after collector joins.
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        // Check all buffered OP5 events + wait up to 10 more seconds for
-        // late arrivals. For each OP5 user, check if their SSRC appeared
-        // in VoiceTick (meaning DAVE decryption works for them).
+        // Drain buffered OP5 events, check each against ssrcs_seen
         let mut broken_ssrcs: Vec<(u32, u64)> = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-
-        // Drain buffered OP5 events first
         while let Ok(evt) = op5_rx.try_recv() {
             let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
             if !seen.contains(&evt.ssrc) {
@@ -879,16 +876,16 @@ fn spawn_dave_heal_task(
             }
         }
 
-        // If we already found broken speakers from the buffered events,
-        // give them one more chance (2s timer per R2)
+        // Give broken speakers 2s more to appear
         if !broken_ssrcs.is_empty() {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
             broken_ssrcs.retain(|(ssrc, _)| !seen.contains(ssrc));
         }
 
-        // Also watch for new OP5 events until the deadline
+        // Wait up to 10s for late OP5 arrivals
         if broken_ssrcs.is_empty() {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
             loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
@@ -896,125 +893,191 @@ fn spawn_dave_heal_task(
                 }
                 match tokio::time::timeout(remaining, op5_rx.recv()).await {
                     Ok(Some(evt)) => {
-                        // OP5 fired — give 2s for the SSRC to appear
                         tokio::time::sleep(Duration::from_secs(2).min(
                             deadline.saturating_duration_since(tokio::time::Instant::now()),
                         )).await;
                         let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
                         if !seen.contains(&evt.ssrc) {
                             broken_ssrcs.push((evt.ssrc, evt.user_id));
-                            break; // Found a broken speaker — trigger heal
+                            break;
                         }
                     }
-                    Ok(None) => break, // Channel closed (session ended)
-                    Err(_) => break,   // Deadline reached — all good
+                    Ok(None) => return, // Session ended
+                    Err(_) => break,    // Deadline — all good
                 }
             }
         }
 
-        // Fallback: OP5 is edge-triggered. If feeders were already speaking
-        // when the collector joined, OP5 never fires and the check above
-        // passes vacuously. Detect this by comparing: we expect consented
-        // users to have mapped SSRCs. If ssrc_map is empty but ssrcs_seen
-        // has entries, OP5 was missed and we should reconnect to get fresh
-        // OP5 events + a new MLS Welcome.
-        if broken_ssrcs.is_empty() {
-            let mapped_count = ssrc_map.lock().expect("ssrc_map poisoned").len();
-            let seen_count = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
-
-            if mapped_count < consented_count && seen_count > 0 {
+        // Fallback: if no OP5 events fired at all (edge-trigger missed),
+        // check ssrc_map vs consented count.
+        let needs_heal = if !broken_ssrcs.is_empty() {
+            true
+        } else {
+            let mapped = ssrc_map.lock().expect("ssrc_map poisoned").len();
+            let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
+            if mapped < consented_count {
                 warn!(
                     session_id = %session_id,
-                    mapped = mapped_count,
-                    seen = seen_count,
-                    consented = consented_count,
-                    "dave_heal_triggered — SSRCs in VoiceTick but OP5 never mapped them \
-                     (edge-trigger missed, likely DAVE broken)"
+                    mapped, seen, consented = consented_count,
+                    "dave_heal_triggered — {} mapped of {} consented after grace period",
+                    mapped, consented_count,
                 );
-                // Fall through to the heal path below
-            } else if mapped_count < consented_count && seen_count == 0 {
-                warn!(
-                    session_id = %session_id,
-                    mapped = mapped_count,
-                    consented = consented_count,
-                    "dave_heal_triggered — no SSRCs seen at all after grace period"
-                );
-                // Fall through to heal
+                true
             } else {
                 info!(
                     session_id = %session_id,
-                    mapped = mapped_count,
-                    seen = seen_count,
-                    "dave_heal_check_passed — all OP5 speakers confirmed in VoiceTick"
+                    mapped, seen,
+                    "dave_heal_initial_check_passed"
                 );
-                return;
+                false
             }
-        }
+        };
 
-        // Check session is still active before healing
-        {
-            let sessions = heal_sessions.lock().await;
-            match sessions.get(guild_id) {
-                Some(s) if s.id == session_id && !s.phase.is_terminal() => {}
-                _ => {
-                    info!(session_id = %session_id, "dave_heal_aborted — session ended");
-                    return;
-                }
-            }
-        }
-
-        warn!(
-            session_id = %session_id,
-            broken_count = broken_ssrcs.len(),
-            broken_ssrcs = ?broken_ssrcs.iter().map(|(s, u)| format!("{}(uid={})", s, u)).collect::<Vec<_>>(),
-            "dave_heal_triggered — OP5 fired but SSRC missing from VoiceTick, reconnecting"
-        );
-
-        // Leave voice
-        let _ = heal_manager.leave(guild_id_obj).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-
-        // Bail if the session was stopped while we were disconnected
-        {
-            let sessions = heal_sessions.lock().await;
-            match sessions.get(guild_id) {
-                Some(s) if s.id == session_id && !s.phase.is_terminal() => {}
-                _ => {
-                    info!(
-                        session_id = %session_id,
-                        "dave_heal_aborted — session ended during reconnect"
-                    );
-                    return;
-                }
-            }
-        }
-
-        // Rejoin voice to get a fresh MLS Welcome
-        match heal_manager.join(guild_id_obj, channel_id).await {
-            Ok(new_call) => {
-                let mut sessions = heal_sessions.lock().await;
-                if let Some(s) = sessions.get_mut(guild_id) {
-                    let mut handler = new_call.lock().await;
-                    s.reattach_audio(&mut handler);
-                }
-            }
-            Err(e) => {
-                error!(
+        if needs_heal {
+            if !broken_ssrcs.is_empty() {
+                warn!(
                     session_id = %session_id,
-                    error = %e,
-                    "dave_heal_rejoin_failed"
+                    broken = ?broken_ssrcs.iter().map(|(s, u)| format!("{}(uid={})", s, u)).collect::<Vec<_>>(),
+                    "dave_heal_triggered — OP5 fired but SSRC missing from VoiceTick"
                 );
-                return;
             }
+            healed = do_heal(
+                &heal_sessions, &heal_manager, guild_id, guild_id_obj,
+                channel_id, &session_id,
+            ).await;
         }
 
-        // Wait for DAVE on the fresh connection
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Signal stable — either check passed or heal completed/failed
+        stable_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        info!(session_id = %session_id, healed, "recording_stable");
 
-        // Play announcement again to signal the heal to users in voice
-        play_start_announcement(&heal_manager, guild_id_obj).await;
-        info!(session_id = %session_id, "dave_heal_complete");
+        // --- Continuous monitoring ---
+        // Keep consuming OP5 events for the rest of the session. If a new
+        // OP5 fires and the SSRC doesn't appear in VoiceTick within 2s,
+        // trigger a one-shot heal (if we haven't already healed).
+        loop {
+            match op5_rx.recv().await {
+                Some(evt) => {
+                    // Already seen this SSRC? Skip.
+                    {
+                        let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
+                        if seen.contains(&evt.ssrc) {
+                            continue;
+                        }
+                    }
+
+                    // New SSRC from OP5 — give 2s for VoiceTick to confirm
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    {
+                        let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned");
+                        if seen.contains(&evt.ssrc) {
+                            continue; // Confirmed, DAVE working for this speaker
+                        }
+                    }
+
+                    // DAVE broken for this speaker mid-session
+                    if healed {
+                        warn!(
+                            session_id = %session_id,
+                            ssrc = evt.ssrc, user_id = evt.user_id,
+                            "dave_broken_mid_session — already healed once, cannot retry"
+                        );
+                        continue;
+                    }
+
+                    warn!(
+                        session_id = %session_id,
+                        ssrc = evt.ssrc, user_id = evt.user_id,
+                        "dave_heal_triggered_mid_session — OP5 fired but SSRC missing"
+                    );
+                    healed = do_heal(
+                        &heal_sessions, &heal_manager, guild_id, guild_id_obj,
+                        channel_id, &session_id,
+                    ).await;
+
+                    // After a heal, op5_rx is stale (old Call's SpeakingTracker
+                    // is gone). We need the new op5_rx from reattach_audio.
+                    // Take it from the session.
+                    let new_rx = {
+                        let mut sessions = heal_sessions.lock().await;
+                        sessions.get_mut(guild_id).and_then(|s| match &mut s.phase {
+                            Phase::Recording(data) => data.op5_rx.take(),
+                            _ => None,
+                        })
+                    };
+                    match new_rx {
+                        Some(rx) => *op5_rx = rx,
+                        None => {
+                            info!(session_id = %session_id, "dave_monitor_exit — no new op5_rx after heal");
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    // Channel closed — session ended
+                    info!(session_id = %session_id, "dave_monitor_exit — session ended");
+                    return;
+                }
+            }
+        }
     });
+}
+
+/// Execute a single heal: leave voice, wait, rejoin, reattach, play announcement.
+/// Returns true if the rejoin succeeded.
+async fn do_heal(
+    sessions: &Arc<tokio::sync::Mutex<crate::session::SessionManager>>,
+    manager: &Arc<songbird::Songbird>,
+    guild_id: u64,
+    guild_id_obj: GuildId,
+    channel_id: ChannelId,
+    session_id: &str,
+) -> bool {
+    // Check session still active
+    {
+        let s = sessions.lock().await;
+        match s.get(guild_id) {
+            Some(s) if s.id == session_id && !s.phase.is_terminal() => {}
+            _ => {
+                info!(session_id = %session_id, "dave_heal_aborted — session ended");
+                return false;
+            }
+        }
+    }
+
+    let _ = manager.leave(guild_id_obj).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Re-check after disconnect
+    {
+        let s = sessions.lock().await;
+        match s.get(guild_id) {
+            Some(s) if s.id == session_id && !s.phase.is_terminal() => {}
+            _ => {
+                info!(session_id = %session_id, "dave_heal_aborted — session ended during reconnect");
+                return false;
+            }
+        }
+    }
+
+    match manager.join(guild_id_obj, channel_id).await {
+        Ok(new_call) => {
+            let mut sessions = sessions.lock().await;
+            if let Some(s) = sessions.get_mut(guild_id) {
+                let mut handler = new_call.lock().await;
+                s.reattach_audio(&mut handler);
+            }
+        }
+        Err(e) => {
+            error!(session_id = %session_id, error = %e, "dave_heal_rejoin_failed");
+            return false;
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    play_start_announcement(manager, guild_id_obj).await;
+    info!(session_id = %session_id, "dave_heal_complete");
+    true
 }
 
 // ---------------------------------------------------------------------------

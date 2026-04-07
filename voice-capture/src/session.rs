@@ -174,6 +174,11 @@ pub struct Session {
 
     // Audio config
     pub audio_received: Arc<std::sync::atomic::AtomicBool>,
+    /// Set to true once the DAVE heal check passes or heal completes.
+    /// The harness polls this via GET /status to know when feeders can
+    /// start transmitting. In production, the start announcement serves
+    /// the same purpose (it plays after heal settles).
+    pub recording_stable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Session {
@@ -204,6 +209,7 @@ impl Session {
             license_cleanup_tasks: Vec::new(),
             auto_stop_task: None,
             audio_received: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            recording_stable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -400,6 +406,13 @@ impl Session {
     /// that VoiceTick flips to true on the first decoded packet.
     pub fn has_audio(&self) -> bool {
         self.audio_received
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True once the DAVE heal check has passed or heal has completed.
+    /// Polled by the harness GET /status endpoint.
+    pub fn is_stable(&self) -> bool {
+        self.recording_stable
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
