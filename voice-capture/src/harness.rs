@@ -274,7 +274,10 @@ async fn record(
         ));
     }
 
-    let batch_input: Vec<(u64, bool)> = members.iter().map(|(uid, _)| (uid.get(), false)).collect();
+    let batch_input: Vec<(u64, bool, Option<String>)> = members
+        .iter()
+        .map(|(uid, name)| (uid.get(), false, Some(name.clone())))
+        .collect();
     match state.api.add_participants_batch(session_uuid, &batch_input).await {
         Ok(rows) => {
             let mut sessions = state.sessions.lock().await;

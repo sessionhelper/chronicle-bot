@@ -93,6 +93,8 @@ struct AddParticipantRequest {
     user_id: Option<Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mid_session_join: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -363,6 +365,7 @@ impl DataApiClient {
         session_id: Uuid,
         discord_user_id: u64,
         mid_session_join: bool,
+        display_name: Option<String>,
     ) -> Result<ParticipantResponse, ApiError> {
         let user = self.upsert_user(discord_user_id).await?;
         let resp = self
@@ -375,6 +378,7 @@ impl DataApiClient {
             .json(&AddParticipantRequest {
                 user_id: Some(user.id),
                 mid_session_join: Some(mid_session_join),
+                display_name,
             })
             .send()
             .await?;
@@ -389,17 +393,18 @@ impl DataApiClient {
     pub async fn add_participants_batch(
         &self,
         session_id: Uuid,
-        participants: &[(u64, bool)],
+        participants: &[(u64, bool, Option<String>)],
     ) -> Result<Vec<ParticipantResponse>, ApiError> {
         if participants.is_empty() {
             return Ok(Vec::new());
         }
         let mut requests = Vec::with_capacity(participants.len());
-        for &(discord_user_id, mid_session_join) in participants {
-            let user = self.upsert_user(discord_user_id).await?;
+        for (discord_user_id, mid_session_join, display_name) in participants {
+            let user = self.upsert_user(*discord_user_id).await?;
             requests.push(AddParticipantRequest {
                 user_id: Some(user.id),
-                mid_session_join: Some(mid_session_join),
+                mid_session_join: Some(*mid_session_join),
+                display_name: display_name.clone(),
             });
         }
         let resp = self
