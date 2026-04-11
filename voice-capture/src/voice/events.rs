@@ -149,7 +149,7 @@ async fn handle_mid_session_join(
     if let Some(sid_str) = &session_id_str
         && let Ok(sid) = uuid::Uuid::parse_str(sid_str)
     {
-        match state.api.add_participant(sid, user_id.get(), true).await {
+        match state.api.add_participant(sid, user_id.get(), true, Some(display_name.clone())).await {
             Ok(row) => {
                 let mut sessions = state.sessions.lock().await;
                 if let Some(s) = sessions.get_mut(guild_id.get()) {

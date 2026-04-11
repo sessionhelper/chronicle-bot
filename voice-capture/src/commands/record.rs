@@ -161,8 +161,8 @@ pub async fn handle_record(
         if !create_failed {
             // Blocklist check per user first. Users who've opted out
             // globally are dropped from the batch before it's sent.
-            let mut accepted: Vec<(UserId, u64)> = Vec::with_capacity(members.len());
-            for (uid, _name) in &members {
+            let mut accepted: Vec<(UserId, u64, String)> = Vec::with_capacity(members.len());
+            for (uid, name) in &members {
                 match state.api.check_blocklist(uid.get()).await {
                     Ok(true) => {
                         tracing::info!(
@@ -176,22 +176,22 @@ pub async fn handle_record(
                     }
                     _ => {}
                 }
-                accepted.push((*uid, uid.get()));
+                accepted.push((*uid, uid.get(), name.clone()));
             }
 
             // Single batch insert + single response → one HTTP round trip
             // regardless of party size. Cache each returned UUID on the
             // local Session so consent/license clicks hit the fast path.
-            let batch_input: Vec<(u64, bool)> = accepted
+            let batch_input: Vec<(u64, bool, Option<String>)> = accepted
                 .iter()
-                .map(|(_, raw)| (*raw, false))
+                .map(|(_, raw, name)| (*raw, false, Some(name.clone())))
                 .collect();
             match state.api.add_participants_batch(sid, &batch_input).await {
                 Ok(rows) => {
                     let count = rows.len();
                     let mut sessions = state.sessions.lock().await;
                     if let Some(s) = sessions.get_mut(guild_id.get()) {
-                        for ((user_id, _), row) in accepted.iter().zip(rows.iter()) {
+                        for ((user_id, _, _), row) in accepted.iter().zip(rows.iter()) {
                             s.set_participant_uuid(*user_id, row.id);
                         }
                     }
@@ -232,8 +232,8 @@ pub async fn handle_record(
                     match sessions.get(guild_id.get()) {
                         Some(s) => accepted
                             .iter()
-                            .filter(|(_, raw)| bypass.contains(raw))
-                            .filter_map(|(uid, _)| s.participant_uuid(*uid).map(|pid| (*uid, pid)))
+                            .filter(|(_, raw, _)| bypass.contains(raw))
+                            .filter_map(|(uid, _, _)| s.participant_uuid(*uid).map(|pid| (*uid, pid)))
                             .collect(),
                         None => Vec::new(),
                     }
