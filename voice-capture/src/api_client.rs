@@ -603,7 +603,7 @@ impl DataApiClient {
 
     /// Upload a PCM audio chunk with retry on transient errors (R7).
     ///
-    /// Retry policy, mirroring `ovp-worker::api_client::download_chunk_with_retry`:
+    /// Retry policy, mirroring `chronicle-worker::api_client::download_chunk_with_retry`:
     /// - **5xx** (server error) or network error: retry up to 3 times with
     ///   1s / 2s / 4s backoff.
     /// - **401** (unauthorized): re-authenticate once, then retry. The
