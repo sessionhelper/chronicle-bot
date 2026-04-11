@@ -83,11 +83,25 @@ guild_commands_registered guild_id=…
 ## How it works
 
 1. GM runs `/record` in a text channel while in a voice channel
-2. Bot posts a consent embed — each player clicks Accept, Decline, or Decline Audio (no audio, consent to transcript only)
-3. Recording starts after everyone responds (quorum met) and the bot joins voice
-4. Bot captures per-user audio via DAVE E2EE, filtered by the consented_users set
-5. Per-speaker 2 MB raw PCM chunks (~10.92s of s16le stereo 48 kHz) are uploaded to the Data API continuously during recording
-6. GM runs `/stop` (or the channel empties for 30s and auto-stops) — session finalized, S3 upload complete, data-api marks the session ready
+2. Bot posts a consent embed with two buttons: **Accept** (I consent to being recorded) and **Decline** (do not record me)
+3. After clicking Accept, a second embed row shows two optional license toggles that default to off (fully open): **No LLM Training** and **No Public Release**. The participant can flip either or both at any time — they default to the fully-open posture (both flags off → published under CC BY-SA 4.0 in the open dataset)
+4. Recording starts after everyone has responded to the Accept/Decline question (quorum met) and the bot joins voice
+5. Bot captures per-user audio via DAVE E2EE, filtered by the set of participants who Accepted
+6. Per-speaker 2 MB raw PCM chunks (~10.92s of s16le stereo 48 kHz) are uploaded to the Data API continuously during recording
+7. GM runs `/stop` (or the channel empties for 30s and auto-stops) — session finalized, S3 upload complete, data-api marks the session ready
+
+## Two-flag license model
+
+The bot records two independent boolean license flags per accepted participant, separately from the participation yes/no:
+
+| `no_llm_training` | `no_public_release` | Meaning | Label |
+|---|---|---|---|
+| false | false | Publish in the open dataset, allow training | `ovp-open` |
+| true  | false | Publish in the public dataset, but exclude from training corpora | `ovp-rail` *(license label tentative)* |
+| false | true  | Keep private to Session Helper LLC for its own projects; do not release publicly | internal |
+| true  | true  | Fully restricted — do not publish, do not train | restricted |
+
+The flags can also be toggled after the session in the participant portal, so a speaker can change their mind up until their data enters the dataset. Participation (`consent_scope`) is the upfront Accept/Decline question; the license flags are the post-capture "what can you do with my data" question.
 
 ## Mid-session join handling
 
