@@ -971,11 +971,15 @@ fn spawn_dave_heal_task(
         // Two detection paths run in parallel:
         // 1. OP5 events: if a new OP5 fires and the SSRC doesn't appear
         //    in VoiceTick within 2s, DAVE is broken.
-        // 2. Periodic fallback (every 10s): if ssrcs_seen has entries that
+        // 2. Periodic fallback (every 5s): if ssrcs_seen has entries that
         //    ssrc_map doesn't, OP5 was edge-triggered away and we missed it.
         //    This catches the case where feeders were already in "speaking"
         //    state before the collector joined.
-        let mut fallback_interval = tokio::time::interval(Duration::from_secs(10));
+        //
+        //    Was 10s; reduced to 5s to align with the dead-connection
+        //    threshold (also 5s). Discord sends ~50 packets/sec/speaker,
+        //    so 5s is more than enough time for real audio to arrive.
+        let mut fallback_interval = tokio::time::interval(Duration::from_secs(5));
         fallback_interval.tick().await; // consume the immediate first tick
 
         loop {
@@ -1059,14 +1063,22 @@ fn spawn_dave_heal_task(
                             seen = seen_count, mapped = mapped_count, consented = consented_count,
                             "dave_heal_triggered — SSRCs in VoiceTick but unmapped (OP5 edge-trigger missed)"
                         );
-                    } else if seen_count == 0 && mapped_count == 0 && secs_since_stable >= 30 {
-                        // 30s after stable, still no SSRCs at all. DAVE
+                    } else if seen_count == 0 && mapped_count == 0 && secs_since_stable >= 5 {
+                        // 5s after stable, still no SSRCs at all. DAVE
                         // connection is completely dead — no decoded audio,
                         // no OP5, nothing. Force heal.
+                        //
+                        // Was 30s; reduced to 5s because the initial DAVE
+                        // handshake frequently produces a session that
+                        // passes all checks but never delivers decoded
+                        // packets. 5s is long enough for real audio to
+                        // arrive (Discord sends ~50 packets/sec/speaker)
+                        // but short enough to avoid losing the first 30s
+                        // of a recording.
                         warn!(
                             session_id = %session_id,
                             secs_since_stable,
-                            "dave_heal_triggered — no SSRCs seen 30s after stable, connection dead"
+                            "dave_heal_triggered — no SSRCs seen 5s after stable, connection dead"
                         );
                     } else {
                         continue;
