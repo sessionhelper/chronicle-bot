@@ -1095,11 +1095,24 @@ fn spawn_dave_heal_task(
                     let consented_count = consented_users.lock().await.len();
 
                     if seen_count > 0 && mapped_count < consented_count {
-                        // SSRCs in VoiceTick but unmapped — edge-trigger missed
+                        // SSRCs in VoiceTick but unmapped. OP5 is edge-triggered
+                        // and Discord does NOT re-send it for pre-existing speakers
+                        // when a new participant joins. No bot in the ecosystem
+                        // (Craig, discord.js, pycord) has a "request OP5" mechanism.
+                        //
+                        // The only reliable way to get mappings is a reconnect:
+                        // leaving and rejoining forces Discord to re-issue OP5
+                        // for all current speakers. This is a one-shot operation
+                        // that happens once per session at startup.
+                        //
+                        // Ecosystem precedent: Craig drops unmapped packets
+                        // silently. discord.js drops them too. Pycord buffers
+                        // them with member=None. We reconnect to get the mapping
+                        // so we can capture from the start.
                         warn!(
                             session_id = %session_id,
                             seen = seen_count, mapped = mapped_count, consented = consented_count,
-                            "dave_heal_triggered — SSRCs in VoiceTick but unmapped (OP5 edge-trigger missed)"
+                            "reconnecting to acquire SSRC→user mappings (OP5 edge-trigger missed)"
                         );
                     } else if seen_count == 0 && mapped_count == 0 && secs_since_stable >= 5 {
                         // 5s after stable, still no SSRCs at all. DAVE
