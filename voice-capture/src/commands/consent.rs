@@ -956,11 +956,54 @@ fn spawn_dave_heal_task(
             ).await;
         }
 
-        // Signal stable — either check passed or heal completed/failed.
+        // --- Wait for proof of audio before declaring stable ---
+        //
+        // Don't set stable=true until at least 1 SSRC has been seen in
+        // VoiceTick (meaning decoded audio packets are flowing). This
+        // prevents the e2e harness from starting feeders before the bot
+        // can actually hear them.
+        //
+        // If no SSRCs arrive within 5s, trigger a dead-connection heal
+        // and then set stable regardless — this breaks any deadlock
+        // where feeders are waiting for stable to play.
+        if !healed {
+            let audio_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let seen = ssrcs_seen.lock().expect("ssrcs_seen poisoned").len();
+                if seen > 0 {
+                    info!(session_id = %session_id, seen, "audio_confirmed_pre_stable");
+                    break;
+                }
+                if tokio::time::Instant::now() >= audio_deadline {
+                    warn!(
+                        session_id = %session_id,
+                        "no audio 5s after initial check — healing before stable"
+                    );
+                    healed = do_heal(
+                        &heal_sessions, &heal_manager, guild_id, guild_id_obj,
+                        channel_id, &session_id,
+                    ).await;
+
+                    let new_rx = {
+                        let mut sessions = heal_sessions.lock().await;
+                        sessions.get_mut(guild_id).and_then(|s| match &mut s.phase {
+                            Phase::Recording(data) => data.op5_rx.take(),
+                            _ => None,
+                        })
+                    };
+                    if let Some(rx) = new_rx {
+                        *op5_rx = rx;
+                    }
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+
+        // Signal stable — either audio confirmed or heal completed.
         // Play the start announcement NOW. This is the contract: the
         // announcement means "recording is stable, you can talk."
         if !healed {
-            // If we healed, do_heal already played the announcement.
             play_start_announcement(&heal_manager, guild_id_obj).await;
         }
         stable_flag.store(true, std::sync::atomic::Ordering::Relaxed);
