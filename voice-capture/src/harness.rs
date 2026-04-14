@@ -297,7 +297,7 @@ pub async fn spawn(state: Arc<AppState>) {
         return;
     }
     let port = state.config.harness_port;
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::new(state.config.harness_bind, port);
     let app = router(state);
     tokio::spawn(async move {
         info!(%addr, "harness_http_listening");

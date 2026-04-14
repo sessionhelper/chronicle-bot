@@ -61,6 +61,13 @@ pub struct Config {
     /// TCP port for the E2E harness HTTP server, inside the container.
     #[arg(long, env = "HARNESS_PORT", default_value_t = 8010)]
     pub harness_port: u16,
+
+    /// Bind address for the harness HTTP server. Defaults to loopback for
+    /// host-run safety; in Docker set HARNESS_BIND=0.0.0.0 so the compose
+    /// port mapping (`127.0.0.1:<port>:<port>`) can reach it. Host-side
+    /// safety is still enforced by the loopback-only port mapping.
+    #[arg(long, env = "HARNESS_BIND", default_value = "127.0.0.1")]
+    pub harness_bind: std::net::IpAddr,
 }
 
 impl Config {
@@ -91,6 +98,7 @@ mod tests {
             require_all_consent: true,
             harness_enabled: false,
             harness_port: 8010,
+            harness_bind: "127.0.0.1".parse().unwrap(),
         }
     }
 
