@@ -132,75 +132,93 @@ impl AudioReceiver {
     }
 }
 
+impl TickCounters {
+    fn bump_tick(&self, speaking_empty: bool) -> u64 {
+        let tick = self.ticks_total.fetch_add(1, Ordering::Relaxed);
+        let bucket = if speaking_empty { &self.ticks_empty_speaking } else { &self.ticks_with_speaking };
+        bucket.fetch_add(1, Ordering::Relaxed);
+        tick
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.ticks_total.load(Ordering::Relaxed),
+            self.ticks_with_speaking.load(Ordering::Relaxed),
+            self.decoded_packets.load(Ordering::Relaxed),
+            self.silent_packets.load(Ordering::Relaxed),
+            self.unmapped_ssrc.load(Ordering::Relaxed),
+            self.packets_forwarded.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl AudioReceiver {
+    /// Log a rollup snapshot every 250 ticks (~5s at 50 Hz). INFO level so
+    /// it surfaces without bumping the whole crate to debug.
+    fn maybe_log_rollup(&self, tick: u64) {
+        if tick == 0 || !tick.is_multiple_of(250) {
+            return;
+        }
+        let (ticks, with_speaking, decoded, silent, unmapped, forwarded) = self.counters.snapshot();
+        let ssrc_map_len = self.obs.ssrc_map.lock().map(|m| m.len()).unwrap_or(0);
+        let ssrcs_seen = self.obs.ssrcs_seen.lock().map(|s| s.len()).unwrap_or(0);
+        info!(
+            ticks, with_speaking, decoded, silent, unmapped, forwarded,
+            ssrc_map_len, ssrcs_seen,
+            "voice_rx_rollup"
+        );
+    }
+
+    /// Route one speaker's slice for this tick. Returns early on the two
+    /// interesting failure modes (silent packet = likely DAVE decrypt fail,
+    /// unmapped SSRC = OP5 didn't arrive yet), bumping the matching counter
+    /// and warning on the first few of each so operators see the symptom
+    /// without reading metrics.
+    fn handle_speaker(&self, ssrc: u32, data: &songbird::events::context_data::SpeakingData, ssrc_map: &HashMap<u32, u64>) {
+        let Some(decoded) = data.decoded_voice.as_ref() else {
+            let n = self.counters.silent_packets.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 3 {
+                warn!(ssrc, "voice_tick_no_decoded (DAVE decrypt fail or silent)");
+            }
+            return;
+        };
+        self.counters.decoded_packets.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut s) = self.obs.ssrcs_seen.lock()
+            && s.insert(ssrc)
+        {
+            info!(ssrc, samples = decoded.len(), "ssrc_first_audio");
+        }
+        let Some(&user_id) = ssrc_map.get(&ssrc) else {
+            let n = self.counters.unmapped_ssrc.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 3 {
+                warn!(ssrc, "voice_tick_ssrc_not_mapped (OP5 missing)");
+            }
+            return;
+        };
+        self.counters.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("chronicle_audio_packets_received").increment(1);
+        (self.sink)(AudioPacket { ssrc, user_id, samples: decoded.clone() });
+    }
+}
+
 #[async_trait]
 impl VoiceEventHandler for AudioReceiver {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::VoiceTick(VoiceTick { speaking, .. }) = ctx {
-            let tick = self.counters.ticks_total.fetch_add(1, Ordering::Relaxed);
-            if speaking.is_empty() {
-                self.counters.ticks_empty_speaking.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.counters.ticks_with_speaking.fetch_add(1, Ordering::Relaxed);
-            }
+        let EventContext::VoiceTick(VoiceTick { speaking, .. }) = ctx else {
+            return None;
+        };
 
-            // Rollup every 250 ticks (~5s @ 50 Hz tick rate). INFO level so
-            // it shows up without bumping the crate to debug.
-            if tick.is_multiple_of(250) && tick > 0 {
-                let ttot = self.counters.ticks_total.load(Ordering::Relaxed);
-                let tws = self.counters.ticks_with_speaking.load(Ordering::Relaxed);
-                let dec = self.counters.decoded_packets.load(Ordering::Relaxed);
-                let sil = self.counters.silent_packets.load(Ordering::Relaxed);
-                let unm = self.counters.unmapped_ssrc.load(Ordering::Relaxed);
-                let fwd = self.counters.packets_forwarded.load(Ordering::Relaxed);
-                let ssrc_map_len = self.obs.ssrc_map.lock().map(|m| m.len()).unwrap_or(0);
-                let ssrcs_seen = self.obs.ssrcs_seen.lock().map(|s| s.len()).unwrap_or(0);
-                info!(
-                    ticks = ttot, with_speaking = tws, decoded = dec, silent = sil,
-                    unmapped = unm, forwarded = fwd, ssrc_map_len, ssrcs_seen,
-                    "voice_rx_rollup"
-                );
-                self.counters.last_log_tick.store(tick, Ordering::Relaxed);
-            }
+        let tick = self.counters.bump_tick(speaking.is_empty());
+        self.maybe_log_rollup(tick);
 
-            if speaking.is_empty() {
-                return None;
-            }
-            let ssrc_map = match self.obs.ssrc_map.lock() {
-                Ok(g) => g.clone(),
-                Err(_) => return None,
-            };
-
-            for (ssrc, data) in speaking {
-                let Some(decoded) = data.decoded_voice.as_ref() else {
-                    self.counters.silent_packets.fetch_add(1, Ordering::Relaxed);
-                    // Log the first few silent packets per-SSRC — if we see
-                    // many, that's the DAVE-decrypt-fail signature.
-                    if self.counters.silent_packets.load(Ordering::Relaxed) <= 3 {
-                        warn!(ssrc = *ssrc, "voice_tick_no_decoded (DAVE decrypt fail or silent)");
-                    }
-                    continue;
-                };
-                self.counters.decoded_packets.fetch_add(1, Ordering::Relaxed);
-                if let Ok(mut s) = self.obs.ssrcs_seen.lock() {
-                    if s.insert(*ssrc) {
-                        info!(ssrc = *ssrc, samples = decoded.len(), "ssrc_first_audio");
-                    }
-                }
-                let Some(&user_id) = ssrc_map.get(ssrc) else {
-                    self.counters.unmapped_ssrc.fetch_add(1, Ordering::Relaxed);
-                    if self.counters.unmapped_ssrc.load(Ordering::Relaxed) <= 3 {
-                        warn!(ssrc = *ssrc, "voice_tick_ssrc_not_mapped (OP5 missing)");
-                    }
-                    continue;
-                };
-                self.counters.packets_forwarded.fetch_add(1, Ordering::Relaxed);
-                metrics::counter!("chronicle_audio_packets_received").increment(1);
-                (self.sink)(AudioPacket {
-                    ssrc: *ssrc,
-                    user_id,
-                    samples: decoded.clone(),
-                });
-            }
+        if speaking.is_empty() {
+            return None;
+        }
+        let Ok(ssrc_map) = self.obs.ssrc_map.lock().map(|g| g.clone()) else {
+            return None;
+        };
+        for (ssrc, data) in speaking {
+            self.handle_speaker(*ssrc, data, &ssrc_map);
         }
         None
     }
