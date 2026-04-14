@@ -7,12 +7,14 @@
 //! `Pending → Accepted/Declined` sub-state-machine (F3).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serenity::async_trait;
 use songbird::events::context_data::VoiceTick;
 use songbird::{CoreEvent, Event, EventContext, EventHandler as VoiceEventHandler};
 use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
 
 /// PCM frame for one speaker on one tick. Sent from the VoiceTick handler to
 /// the per-participant router.
@@ -81,12 +83,28 @@ impl Default for AudioObservables {
 /// routes each [`AudioPacket`] to the right per-participant task.
 pub type PacketSink = Arc<dyn Fn(AudioPacket) + Send + Sync + 'static>;
 
+/// Diagnostic counters the VoiceTick handler bumps. Visible at INFO-level
+/// rollups (every 100 ticks or 5s, whichever comes first) so DAVE-class
+/// failures stop being invisible.
+#[derive(Default)]
+struct TickCounters {
+    ticks_total: AtomicU64,
+    ticks_with_speaking: AtomicU64,
+    ticks_empty_speaking: AtomicU64,
+    decoded_packets: AtomicU64,
+    silent_packets: AtomicU64,
+    unmapped_ssrc: AtomicU64,
+    packets_forwarded: AtomicU64,
+    last_log_tick: AtomicU64,
+}
+
 /// The session actor calls this once per heal-cycle attach. `ssrc_map` and
 /// `ssrcs_seen` are Arc'd so the gate-watcher task can observe them in
 /// parallel with the VoiceTick handler.
 pub struct AudioReceiver {
     sink: PacketSink,
     obs: AudioObservables,
+    counters: Arc<TickCounters>,
 }
 
 impl AudioReceiver {
@@ -97,9 +115,11 @@ impl AudioReceiver {
         op5_tx: mpsc::UnboundedSender<Op5Event>,
     ) -> AudioHandle {
         let close = Arc::new(tokio::sync::Notify::new());
+        let counters = Arc::new(TickCounters::default());
         let receiver = Self {
             sink,
             obs: obs.clone(),
+            counters: counters.clone(),
         };
         call.add_global_event(CoreEvent::VoiceTick.into(), receiver);
         let tracker = SpeakingTracker {
@@ -107,6 +127,7 @@ impl AudioReceiver {
             op5_tx,
         };
         call.add_global_event(CoreEvent::SpeakingStateUpdate.into(), tracker);
+        info!("audio_receiver_attached");
         AudioHandle { _close: close }
     }
 }
@@ -115,6 +136,32 @@ impl AudioReceiver {
 impl VoiceEventHandler for AudioReceiver {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         if let EventContext::VoiceTick(VoiceTick { speaking, .. }) = ctx {
+            let tick = self.counters.ticks_total.fetch_add(1, Ordering::Relaxed);
+            if speaking.is_empty() {
+                self.counters.ticks_empty_speaking.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.counters.ticks_with_speaking.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // Rollup every 250 ticks (~5s @ 50 Hz tick rate). INFO level so
+            // it shows up without bumping the crate to debug.
+            if tick.is_multiple_of(250) && tick > 0 {
+                let ttot = self.counters.ticks_total.load(Ordering::Relaxed);
+                let tws = self.counters.ticks_with_speaking.load(Ordering::Relaxed);
+                let dec = self.counters.decoded_packets.load(Ordering::Relaxed);
+                let sil = self.counters.silent_packets.load(Ordering::Relaxed);
+                let unm = self.counters.unmapped_ssrc.load(Ordering::Relaxed);
+                let fwd = self.counters.packets_forwarded.load(Ordering::Relaxed);
+                let ssrc_map_len = self.obs.ssrc_map.lock().map(|m| m.len()).unwrap_or(0);
+                let ssrcs_seen = self.obs.ssrcs_seen.lock().map(|s| s.len()).unwrap_or(0);
+                info!(
+                    ticks = ttot, with_speaking = tws, decoded = dec, silent = sil,
+                    unmapped = unm, forwarded = fwd, ssrc_map_len, ssrcs_seen,
+                    "voice_rx_rollup"
+                );
+                self.counters.last_log_tick.store(tick, Ordering::Relaxed);
+            }
+
             if speaking.is_empty() {
                 return None;
             }
@@ -125,16 +172,28 @@ impl VoiceEventHandler for AudioReceiver {
 
             for (ssrc, data) in speaking {
                 let Some(decoded) = data.decoded_voice.as_ref() else {
+                    self.counters.silent_packets.fetch_add(1, Ordering::Relaxed);
+                    // Log the first few silent packets per-SSRC — if we see
+                    // many, that's the DAVE-decrypt-fail signature.
+                    if self.counters.silent_packets.load(Ordering::Relaxed) <= 3 {
+                        warn!(ssrc = *ssrc, "voice_tick_no_decoded (DAVE decrypt fail or silent)");
+                    }
                     continue;
                 };
-                // Record SSRC as "seen" regardless of mapping — the gate
-                // watcher cares about any audio.
+                self.counters.decoded_packets.fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut s) = self.obs.ssrcs_seen.lock() {
-                    s.insert(*ssrc);
+                    if s.insert(*ssrc) {
+                        info!(ssrc = *ssrc, samples = decoded.len(), "ssrc_first_audio");
+                    }
                 }
                 let Some(&user_id) = ssrc_map.get(ssrc) else {
+                    self.counters.unmapped_ssrc.fetch_add(1, Ordering::Relaxed);
+                    if self.counters.unmapped_ssrc.load(Ordering::Relaxed) <= 3 {
+                        warn!(ssrc = *ssrc, "voice_tick_ssrc_not_mapped (OP5 missing)");
+                    }
                     continue;
                 };
+                self.counters.packets_forwarded.fetch_add(1, Ordering::Relaxed);
                 metrics::counter!("chronicle_audio_packets_received").increment(1);
                 (self.sink)(AudioPacket {
                     ssrc: *ssrc,
@@ -158,8 +217,15 @@ impl VoiceEventHandler for SpeakingTracker {
         if let EventContext::SpeakingStateUpdate(s) = ctx
             && let Some(uid) = s.user_id
         {
-            if let Ok(mut map) = self.ssrc_to_user.lock() {
-                map.insert(s.ssrc, uid.0);
+            let is_new = if let Ok(mut map) = self.ssrc_to_user.lock() {
+                map.insert(s.ssrc, uid.0).is_none()
+            } else {
+                false
+            };
+            if is_new {
+                info!(ssrc = s.ssrc, user_id = uid.0, "op5_ssrc_mapped");
+            } else {
+                debug!(ssrc = s.ssrc, user_id = uid.0, "op5_ssrc_remapped");
             }
             let _ = self.op5_tx.send(Op5Event {
                 ssrc: s.ssrc,
