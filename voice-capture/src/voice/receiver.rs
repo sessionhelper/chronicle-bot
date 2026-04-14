@@ -169,36 +169,6 @@ impl AudioReceiver {
         );
     }
 
-    /// Route one speaker's slice for this tick. Returns early on the two
-    /// interesting failure modes (silent packet = likely DAVE decrypt fail,
-    /// unmapped SSRC = OP5 didn't arrive yet), bumping the matching counter
-    /// and warning on the first few of each so operators see the symptom
-    /// without reading metrics.
-    fn handle_speaker(&self, ssrc: u32, data: &songbird::events::context_data::SpeakingData, ssrc_map: &HashMap<u32, u64>) {
-        let Some(decoded) = data.decoded_voice.as_ref() else {
-            let n = self.counters.silent_packets.fetch_add(1, Ordering::Relaxed) + 1;
-            if n <= 3 {
-                warn!(ssrc, "voice_tick_no_decoded (DAVE decrypt fail or silent)");
-            }
-            return;
-        };
-        self.counters.decoded_packets.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut s) = self.obs.ssrcs_seen.lock()
-            && s.insert(ssrc)
-        {
-            info!(ssrc, samples = decoded.len(), "ssrc_first_audio");
-        }
-        let Some(&user_id) = ssrc_map.get(&ssrc) else {
-            let n = self.counters.unmapped_ssrc.fetch_add(1, Ordering::Relaxed) + 1;
-            if n <= 3 {
-                warn!(ssrc, "voice_tick_ssrc_not_mapped (OP5 missing)");
-            }
-            return;
-        };
-        self.counters.packets_forwarded.fetch_add(1, Ordering::Relaxed);
-        metrics::counter!("chronicle_audio_packets_received").increment(1);
-        (self.sink)(AudioPacket { ssrc, user_id, samples: decoded.clone() });
-    }
 }
 
 #[async_trait]
@@ -217,8 +187,36 @@ impl VoiceEventHandler for AudioReceiver {
         let Ok(ssrc_map) = self.obs.ssrc_map.lock().map(|g| g.clone()) else {
             return None;
         };
+
+        // Inlined: songbird's SpeakingData is not re-exported under a
+        // nameable path, and extracting into a helper requires naming it.
+        // The vertical flow below reads linearly; each `continue` is a
+        // named failure mode.
         for (ssrc, data) in speaking {
-            self.handle_speaker(*ssrc, data, &ssrc_map);
+            let ssrc = *ssrc;
+            let Some(decoded) = data.decoded_voice.as_ref() else {
+                let n = self.counters.silent_packets.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 3 {
+                    warn!(ssrc, "voice_tick_no_decoded (DAVE decrypt fail or silent)");
+                }
+                continue;
+            };
+            self.counters.decoded_packets.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut s) = self.obs.ssrcs_seen.lock()
+                && s.insert(ssrc)
+            {
+                info!(ssrc, samples = decoded.len(), "ssrc_first_audio");
+            }
+            let Some(&user_id) = ssrc_map.get(&ssrc) else {
+                let n = self.counters.unmapped_ssrc.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 3 {
+                    warn!(ssrc, "voice_tick_ssrc_not_mapped (OP5 missing)");
+                }
+                continue;
+            };
+            self.counters.packets_forwarded.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("chronicle_audio_packets_received").increment(1);
+            (self.sink)(AudioPacket { ssrc, user_id, samples: decoded.clone() });
         }
         None
     }
