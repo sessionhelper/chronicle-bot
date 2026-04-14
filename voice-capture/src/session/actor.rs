@@ -217,6 +217,13 @@ pub enum ParticipantCmd {
     /// Pre-gate: drop this participant's cache; no upload. Used when the
     /// participant Declines before gate-open.
     DropCache,
+    /// Flush whatever is currently in the in-memory `accum` to the pre-gate
+    /// disk cache, even if under the 2MB rollover threshold. Driven by the
+    /// actor right before the gate-open disk scan — without this, short
+    /// pre-gate utterances (< ~11s) are lost because the subsequent
+    /// `GateOpened` clears `accum` unconditionally. `reply` fires once the
+    /// write (or no-op) is complete so the actor can sequence disk scans.
+    FlushAccumToDisk { reply: oneshot::Sender<()> },
     /// Gate opened: participant survived (Accepted or still Pending). From
     /// this command forward we ignore the pre-gate cache dir and either
     /// upload directly (Accepted) or keep caching post-gate (Pending).
@@ -342,6 +349,30 @@ async fn run_participant_task(pctx: ParticipantCtx, rx: &mut mpsc::Receiver<Part
                         accum.clear();
                         accum_started = None;
                         mode = PMode::Dropping;
+                    }
+                    ParticipantCmd::FlushAccumToDisk { reply } => {
+                        // Emit whatever's in accum to the pre-gate disk
+                        // cache so the gate-open disk scan can pick it up.
+                        // No-op if empty or not in a caching mode.
+                        if !accum.is_empty()
+                            && matches!(mode, PMode::Cache | PMode::PendingPostGate)
+                        {
+                            let started = accum_started.take().unwrap_or_else(Utc::now);
+                            let payload = std::mem::take(&mut accum);
+                            emit_chunk(
+                                &mut cache,
+                                mode,
+                                &pctx.api,
+                                &pctx.pseudo_id,
+                                session_uuid,
+                                seq,
+                                payload,
+                                started,
+                            )
+                            .await;
+                            seq += 1;
+                        }
+                        let _ = reply.send(());
                     }
                     ParticipantCmd::GateOpened { accepted, session_uuid: sid, mix_tx: mtx } => {
                         // Gate-open: mode transition. For Accepted participants
@@ -1063,6 +1094,22 @@ async fn open_the_gate(env: &mut ActorEnv, session: &mut Session) -> Result<(), 
     })
     .await
     .map_err(|e| format!("mix_sources_join: {e}"))?;
+
+    // Ask every per-speaker task to spill its in-memory accumulator to
+    // the pre-gate disk cache. Without this, short utterances (< ~11s of
+    // audio) never cross the 2MB rollover threshold and are silently lost
+    // when GateOpened clears accum. Oneshot replies synchronize with the
+    // disk scan that follows.
+    let mut flush_waits: Vec<oneshot::Receiver<()>> = Vec::new();
+    for ch in env.participants.values() {
+        let (tx, rx) = oneshot::channel();
+        if ch.tx.send(ParticipantCmd::FlushAccumToDisk { reply: tx }).await.is_ok() {
+            flush_waits.push(rx);
+        }
+    }
+    for rx in flush_waits {
+        let _ = rx.await;
+    }
 
     // Render mix + write to cache before flushing anything.
     let mix_chunks = render_mix_from_caches(&mix_sources_and_accepted);
