@@ -499,7 +499,12 @@ async fn upload_direct(
 ) {
     let size = bytes.len();
     let start = std::time::Instant::now();
-    let client_chunk_id = format!("{session_uuid}:{pseudo_id}:{seq}");
+    // `live:` prefix keeps post-gate direct-upload seq numbers in a
+    // different namespace from pre-gate disk-cache seqs (which also
+    // start at 0). Otherwise the first direct-upload collides with the
+    // first flushed disk chunk under the same client_chunk_id and the
+    // data-api de-dupes it, silently dropping post-gate audio.
+    let client_chunk_id = format!("{session_uuid}:{pseudo_id}:live:{seq}");
     let duration_ms = pcm_bytes_to_duration_ms(size);
     match api
         .upload_chunk_with_retry(
