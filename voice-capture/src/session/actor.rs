@@ -1797,8 +1797,10 @@ mod tests {
         let mut alice = ParticipantCache::open(&root, "s", "alice").unwrap();
         let mut bob = ParticipantCache::open(&root, "s", "bob").unwrap();
         let ts = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
-        alice.append_chunk(&vec![100i16.to_le_bytes()[0]; 4], ts).unwrap();
-        bob.append_chunk(&vec![100i16.to_le_bytes()[0]; 4], ts).unwrap();
+        // 1 second of PCM per speaker so the rendered mix spans a real duration.
+        let one_sec: Vec<u8> = vec![0u8; crate::voice::mixer::BYTES_PER_SEC];
+        alice.append_chunk(&one_sec, ts).unwrap();
+        bob.append_chunk(&one_sec, ts).unwrap();
         // Bob declines → their cache is deleted.
         bob.delete().unwrap();
 
