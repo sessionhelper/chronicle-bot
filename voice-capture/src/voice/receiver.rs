@@ -93,6 +93,15 @@ impl AudioObservables {
     /// takes over (and will match whatever we inferred when the rule was
     /// unambiguous).
     ///
+    /// **Known limitation.** `ssrcs_seen` accumulates monotonically; we
+    /// don't prune SSRCs that stopped producing audio. If user A speaks
+    /// briefly (SSRC observed), leaves before inference fires, and the
+    /// channel now has only user B, the solo rule will attribute A's
+    /// still-in-`seen` SSRC to B. Narrow window (sub-second leave +
+    /// speak), and for single-speaker recordings it can't happen at all.
+    /// Not fixed here — requires timestamped `ssrcs_seen`, tracked as a
+    /// followup.
+    ///
     /// Returns how many SSRCs were inferred on this call.
     pub fn infer_ssrc_mappings(&self, humans_in_channel: &HashSet<serenity::all::UserId>) -> usize {
         let seen_snapshot: HashSet<u32> = match self.ssrcs_seen.lock() {
