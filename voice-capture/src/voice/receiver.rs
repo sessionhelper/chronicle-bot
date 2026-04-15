@@ -25,14 +25,6 @@ pub struct AudioPacket {
     pub samples: Vec<i16>,
 }
 
-/// OP5 speaking-state event — used by the stabilization gate to confirm
-/// SSRC→user_id mappings exist.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub struct Op5Event {
-    pub ssrc: u32,
-    pub user_id: u64,
-}
 
 /// Handle returned from `AudioReceiver::attach` — close it to drop the
 /// VoiceTick forwarding.
@@ -116,16 +108,6 @@ impl AudioObservables {
         if unmapped_ssrcs.is_empty() {
             return 0;
         }
-        // Diagnostic: log the decision inputs so we can see WHY we
-        // abstained. Volume is bounded (gate poll runs at 250ms and
-        // we only get here if something's unmapped). Revert once the
-        // empty-humans_in_channel root cause is settled.
-        info!(
-            humans = humans_in_channel.len(),
-            ssrcs_seen = seen_snapshot.len(),
-            ssrcs_unmapped = unmapped_ssrcs.len(),
-            "infer_ssrc_mappings_eval"
-        );
 
         // Rule 1: solo human in channel.
         if humans_in_channel.len() == 1 {
@@ -239,7 +221,6 @@ impl AudioReceiver {
         call: &mut songbird::Call,
         sink: PacketSink,
         obs: AudioObservables,
-        op5_tx: mpsc::UnboundedSender<Op5Event>,
         heal_tx: mpsc::UnboundedSender<DaveHealRequest>,
     ) -> AudioHandle {
         let close = Arc::new(tokio::sync::Notify::new());
@@ -255,7 +236,6 @@ impl AudioReceiver {
         call.add_global_event(CoreEvent::VoiceTick.into(), receiver);
         let tracker = SpeakingTracker {
             ssrc_to_user: obs.ssrc_map.clone(),
-            op5_tx,
         };
         call.add_global_event(CoreEvent::SpeakingStateUpdate.into(), tracker);
         info!("audio_receiver_attached");
@@ -644,7 +624,6 @@ mod inference_tests {
 
 struct SpeakingTracker {
     ssrc_to_user: Arc<StdMutex<HashMap<u32, u64>>>,
-    op5_tx: mpsc::UnboundedSender<Op5Event>,
 }
 
 #[async_trait]
@@ -672,10 +651,6 @@ impl VoiceEventHandler for SpeakingTracker {
         } else {
             debug!(ssrc = s.ssrc, user_id = uid.0, "op5_ssrc_remapped");
         }
-        let _ = self.op5_tx.send(Op5Event {
-            ssrc: s.ssrc,
-            user_id: uid.0,
-        });
         None
     }
 }

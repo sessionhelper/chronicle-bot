@@ -6,6 +6,5 @@ pub mod mixer;
 pub mod receiver;
 
 pub use receiver::{
-    AudioHandle, AudioObservables, AudioPacket, AudioReceiver, DaveHealRequest, Op5Event,
-    PacketSink,
+    AudioHandle, AudioObservables, AudioPacket, AudioReceiver, DaveHealRequest, PacketSink,
 };

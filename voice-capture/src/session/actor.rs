@@ -650,8 +650,6 @@ struct ActorEnv {
     /// attach time and late additions never receive packets.
     packet_routes: Arc<DashMap<u64, mpsc::Sender<ParticipantCmd>>>,
     expected_user_ids: Arc<StdMutex<HashSet<u64>>>,
-    #[allow(dead_code)]
-    op5_rx: Option<mpsc::UnboundedReceiver<crate::voice::Op5Event>>,
     audio_handle: Option<AudioHandle>,
     pending_flush: JoinSet<Result<(), FlushError>>,
     /// Set post-gate only. `None` pre-gate means there is no data-api row.
@@ -716,12 +714,6 @@ async fn run_actor(
     // Seed humans_in_channel with enrolled participants — they're the ones
     // in the voice channel at /record time.
     let humans_in_channel: HashSet<UserId> = session.participants.keys().copied().collect();
-    info!(
-        session_id = %session.id,
-        participants = session.participants.len(),
-        humans = humans_in_channel.len(),
-        "actor_starting"
-    );
 
     let mut env = ActorEnv {
         state: state.clone(),
@@ -732,7 +724,6 @@ async fn run_actor(
         participants: HashMap::new(),
         packet_routes: Arc::new(DashMap::new()),
         expected_user_ids: expected,
-        op5_rx: None,
         audio_handle: None,
         pending_flush: JoinSet::new(),
         session_uuid: None,
@@ -793,16 +784,13 @@ async fn join_voice_and_attach(env: &mut ActorEnv, session: &mut Session) -> Res
     }
 
     let mut call_lock = call.lock().await;
-    let (sink, _drop_rx) = build_sink_and_rx(&env.participants, env.packet_routes.clone());
-    let (op5_tx, op5_rx_new) = mpsc::unbounded_channel();
+    let sink = build_sink(&env.participants, env.packet_routes.clone());
     let (heal_tx, heal_rx) = mpsc::unbounded_channel();
-    let audio_handle =
-        AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), op5_tx, heal_tx);
+    let audio_handle = AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), heal_tx);
     drop(call_lock);
 
     spawn_dave_heal_consumer(env, session, heal_rx);
     env.audio_handle = Some(audio_handle);
-    env.op5_rx = Some(op5_rx_new);
     Ok(())
 }
 
@@ -883,23 +871,19 @@ fn spawn_dave_heal_consumer(
 /// the supplied shared `routes` map. The Arc is cloned into the sink
 /// closure; the env keeps the other clone so later enrolments can insert
 /// into the same map without rebuilding the sink.
-fn build_sink_and_rx(
+fn build_sink(
     participants: &HashMap<UserId, ParticipantChannel>,
     routes: Arc<DashMap<u64, mpsc::Sender<ParticipantCmd>>>,
-) -> (PacketSink, mpsc::UnboundedReceiver<crate::voice::Op5Event>) {
+) -> PacketSink {
     for (uid, ch) in participants {
         routes.insert(uid.get(), ch.tx.clone());
     }
-    let sink: PacketSink = {
-        let routes = routes.clone();
-        Arc::new(move |pkt: AudioPacket| {
-            if let Some(sender) = routes.get(&pkt.user_id) {
-                let _ = sender.try_send(ParticipantCmd::Packet(pkt));
-            }
-        })
-    };
-    let (_tx, rx) = mpsc::unbounded_channel();
-    (sink, rx)
+    let routes = routes.clone();
+    Arc::new(move |pkt: AudioPacket| {
+        if let Some(sender) = routes.get(&pkt.user_id) {
+            let _ = sender.try_send(ParticipantCmd::Packet(pkt));
+        }
+    })
 }
 
 async fn drive_session(
@@ -1357,16 +1341,13 @@ async fn reattach_audio(env: &mut ActorEnv, session: &Session) {
     let Some(call) = manager.get(GuildId::new(session.guild_id)) else { return };
     // On re-attach (heal path), the shared route map persists — we don't
     // want to drop mappings for participants that are still enrolled.
-    let (sink, _drop_rx) = build_sink_and_rx(&env.participants, env.packet_routes.clone());
-    let (op5_tx, op5_rx) = mpsc::unbounded_channel();
+    let sink = build_sink(&env.participants, env.packet_routes.clone());
     let (heal_tx, heal_rx) = mpsc::unbounded_channel();
     let mut call_lock = call.lock().await;
-    let new_handle =
-        AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), op5_tx, heal_tx);
+    let new_handle = AudioReceiver::attach(&mut call_lock, sink, env.obs.clone(), heal_tx);
     drop(call_lock);
     spawn_dave_heal_consumer(env, session, heal_rx);
     env.audio_handle = Some(new_handle);
-    env.op5_rx = Some(op5_rx);
 }
 
 // ---------------------------------------------------------------------------
