@@ -405,24 +405,34 @@ struct SpeakingTracker {
 #[async_trait]
 impl VoiceEventHandler for SpeakingTracker {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::SpeakingStateUpdate(s) = ctx
-            && let Some(uid) = s.user_id
-        {
-            let is_new = if let Ok(mut map) = self.ssrc_to_user.lock() {
-                map.insert(s.ssrc, uid.0).is_none()
-            } else {
-                false
-            };
-            if is_new {
-                info!(ssrc = s.ssrc, user_id = uid.0, "op5_ssrc_mapped");
-            } else {
-                debug!(ssrc = s.ssrc, user_id = uid.0, "op5_ssrc_remapped");
-            }
-            let _ = self.op5_tx.send(Op5Event {
-                ssrc: s.ssrc,
-                user_id: uid.0,
-            });
+        let EventContext::SpeakingStateUpdate(s) = ctx else {
+            return None;
+        };
+        // Log every OP5 we observe, even the ones we can't map. The
+        // null-user_id case is the one we keep losing sleep over.
+        info!(
+            ssrc = s.ssrc,
+            user_id = ?s.user_id.map(|u| u.0),
+            speaking = ?s.speaking,
+            "op5_raw"
+        );
+        let Some(uid) = s.user_id else {
+            return None;
+        };
+        let is_new = if let Ok(mut map) = self.ssrc_to_user.lock() {
+            map.insert(s.ssrc, uid.0).is_none()
+        } else {
+            false
+        };
+        if is_new {
+            info!(ssrc = s.ssrc, user_id = uid.0, "op5_ssrc_mapped");
+        } else {
+            debug!(ssrc = s.ssrc, user_id = uid.0, "op5_ssrc_remapped");
         }
+        let _ = self.op5_tx.send(Op5Event {
+            ssrc: s.ssrc,
+            user_id: uid.0,
+        });
         None
     }
 }
