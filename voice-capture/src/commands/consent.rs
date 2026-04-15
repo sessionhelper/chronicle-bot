@@ -12,7 +12,7 @@ use tracing::warn;
 
 use crate::commands::respond::{respond, InteractionReply};
 use crate::session::actor::{request, ConsentOutcome, SessionCmd, SessionError};
-use crate::session::{consent_buttons, ConsentScope};
+use crate::session::ConsentScope;
 use crate::state::AppState;
 
 #[tracing::instrument(
@@ -74,10 +74,14 @@ async fn consent_inner(
     .await;
 
     match outcome {
+        // The clicker has made their choice — drop the buttons from
+        // their (ephemeral) embed so it's obvious the click registered.
+        // Other participants still see their own ephemeral copy with
+        // buttons intact; this only affects the user who just clicked.
         Ok(Ok(ConsentOutcome::Ack { embed })) => InteractionReply::UpdateMessage {
             embed: Some(embed),
             content: None,
-            components: vec![consent_buttons()],
+            components: vec![],
         },
         Ok(Ok(ConsentOutcome::QuorumFailed { embed })) => {
             metrics::counter!("chronicle_sessions_total", "outcome" => "cancelled").increment(1);
