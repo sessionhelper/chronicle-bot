@@ -179,8 +179,15 @@ impl Interactionable for ComponentInteraction {
         &'a self,
         ctx: &'a Context,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), serenity::Error>> + Send + 'a>> {
+        // `DeferUpdateMessage` commits to editing the ORIGINAL message
+        // (the one carrying the button) via the interaction webhook once
+        // the handler finishes. Crucially this path works on EPHEMERAL
+        // messages — `Acknowledge` + `channel.edit_message` does not
+        // (ephemerals 404 on channel endpoints, yielding "Unknown
+        // Message"). The consent embed ships as an ephemeral reply to
+        // `/record`, so this difference is load-bearing.
         Box::pin(async move {
-            self.create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+            self.create_response(&ctx.http, CreateInteractionResponse::DeferUpdateMessage)
                 .await
         })
     }
@@ -203,17 +210,19 @@ impl Interactionable for ComponentInteraction {
         content: Option<String>,
         components: Vec<CreateActionRow>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), serenity::Error>> + Send + 'a>> {
+        // Goes through the same interaction webhook as `edit_response`
+        // so it works on ephemeral messages. `channel.edit_message`
+        // would 404 here because ephemerals aren't reachable via the
+        // channel endpoint.
         Box::pin(async move {
-            let mut edit = EditMessage::new().components(components);
+            let mut edit = EditInteractionResponse::new().components(components);
             if let Some(e) = embed {
                 edit = edit.embed(e);
             }
             if let Some(c) = content {
                 edit = edit.content(c);
             }
-            self.channel_id
-                .edit_message(&ctx.http, self.message.id, edit)
-                .await?;
+            self.edit_response(&ctx.http, edit).await?;
             Ok(())
         })
     }
