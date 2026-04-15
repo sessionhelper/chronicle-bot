@@ -1026,12 +1026,15 @@ async fn wait_for_gate(
                 }
             }
             _ = poll.tick() => {
-                // Solo-speaker SSRC inference: if only one non-bot human is
-                // in the voice channel and we're seeing unmapped audio, the
-                // mapping is unambiguous even without OP5. Without this, a
-                // user who started speaking BEFORE the bot's voice-WS finished
-                // handshaking never gets an OP5 and stabilization times out.
-                env.obs.infer_solo_speaker(&env.humans_in_channel);
+                // SSRC-mapping inference: covers the case where Discord's
+                // OP5 SpeakingStateUpdate never fires for a user who was
+                // already speaking before our voice-WS finished handshaking.
+                // Without this, stabilization times out and the session
+                // cancels. Two rules applied: solo (1 human, any unmapped)
+                // and last-missing-pair (exactly 1 unmapped user + 1 unmapped
+                // ssrc). Both are unambiguous by set algebra; abstains
+                // otherwise.
+                env.obs.infer_ssrc_mappings(&env.humans_in_channel);
                 let verdict = stabilization::evaluate(gate_inputs);
                 match tracker.observe(verdict) {
                     StreakStatus::GateOpens { total_secs } => {

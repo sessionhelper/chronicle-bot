@@ -72,25 +72,29 @@ impl AudioObservables {
         }
     }
 
-    /// Backfill SSRC→user mappings when there is exactly one non-bot human
-    /// in the voice channel and we're already seeing audio from unmapped
-    /// SSRCs. Covers the case where Discord's OP5 `SpeakingStateUpdate`
-    /// never fires because the user was already talking before the bot's
-    /// voice-WS handshake completed.
+    /// Backfill SSRC→user mappings when the pair is unambiguous.
     ///
-    /// Safe to call repeatedly (on every stabilization poll tick). If a
-    /// real OP5 arrives later we keep the inferred mapping; it'll match
-    /// what the real OP5 would have written anyway (single candidate).
+    /// Covers the case where Discord's OP5 `SpeakingStateUpdate` never
+    /// fires for a given SSRC because the user was already talking before
+    /// the bot's voice-WS handshake completed. Discord *claims* the
+    /// initial Speaking event is always sent before first RTP, but
+    /// empirically that's not what we observe in our dev captures.
+    ///
+    /// Two inference rules, tried in order:
+    ///
+    /// 1. **Solo**: exactly one non-bot human in the voice channel. Any
+    ///    unmapped SSRC must belong to them.
+    /// 2. **Last-missing pair**: multiple humans in channel, but exactly
+    ///    one is missing an SSRC mapping *and* exactly one SSRC seen is
+    ///    missing a user. That pair is forced by elimination.
+    ///
+    /// Safe to call repeatedly (on every stabilization poll tick). Never
+    /// overwrites an existing mapping — if a real OP5 arrives later it
+    /// takes over (and will match whatever we inferred when the rule was
+    /// unambiguous).
     ///
     /// Returns how many SSRCs were inferred on this call.
-    pub fn infer_solo_speaker(&self, humans_in_channel: &HashSet<serenity::all::UserId>) -> usize {
-        if humans_in_channel.len() != 1 {
-            return 0;
-        }
-        let only_human = match humans_in_channel.iter().next() {
-            Some(u) => u.get(),
-            None => return 0,
-        };
+    pub fn infer_ssrc_mappings(&self, humans_in_channel: &HashSet<serenity::all::UserId>) -> usize {
         let seen_snapshot: HashSet<u32> = match self.ssrcs_seen.lock() {
             Ok(g) => g.clone(),
             Err(_) => return 0,
@@ -98,20 +102,55 @@ impl AudioObservables {
         let Ok(mut map) = self.ssrc_map.lock() else {
             return 0;
         };
-        let mut inferred = 0;
-        for ssrc in seen_snapshot {
-            if let std::collections::hash_map::Entry::Vacant(e) = map.entry(ssrc) {
-                e.insert(only_human);
+        let unmapped_ssrcs: HashSet<u32> =
+            seen_snapshot.iter().copied().filter(|s| !map.contains_key(s)).collect();
+        if unmapped_ssrcs.is_empty() {
+            return 0;
+        }
+
+        // Rule 1: solo human in channel.
+        if humans_in_channel.len() == 1 {
+            let only_human = match humans_in_channel.iter().next() {
+                Some(u) => u.get(),
+                None => return 0,
+            };
+            let mut inferred = 0;
+            for ssrc in &unmapped_ssrcs {
+                map.insert(*ssrc, only_human);
                 inferred += 1;
                 info!(
-                    ssrc,
+                    ssrc = *ssrc,
                     user_id = only_human,
-                    "ssrc_inferred_solo_speaker (no OP5 observed)"
+                    rule = "solo",
+                    "ssrc_inferred (no OP5 observed)"
                 );
-                metrics::counter!("chronicle_ssrc_solo_inferences_total").increment(1);
+                metrics::counter!("chronicle_ssrc_inferences_total", "rule" => "solo").increment(1);
             }
+            return inferred;
         }
-        inferred
+
+        // Rule 2: last-missing pair.
+        let mapped_users: HashSet<u64> = map.values().copied().collect();
+        let unmapped_humans: HashSet<u64> = humans_in_channel
+            .iter()
+            .map(|u| u.get())
+            .filter(|u| !mapped_users.contains(u))
+            .collect();
+        if unmapped_humans.len() == 1 && unmapped_ssrcs.len() == 1 {
+            let Some(&user) = unmapped_humans.iter().next() else { return 0; };
+            let Some(&ssrc) = unmapped_ssrcs.iter().next() else { return 0; };
+            map.insert(ssrc, user);
+            info!(
+                ssrc,
+                user_id = user,
+                rule = "last_missing",
+                "ssrc_inferred (no OP5 observed)"
+            );
+            metrics::counter!("chronicle_ssrc_inferences_total", "rule" => "last_missing").increment(1);
+            return 1;
+        }
+
+        0
     }
 }
 
@@ -440,7 +479,7 @@ mod streak_tests {
 }
 
 #[cfg(test)]
-mod infer_solo_tests {
+mod inference_tests {
     use super::*;
     use serenity::all::UserId;
 
@@ -455,11 +494,13 @@ mod infer_solo_tests {
         }
     }
 
+    // --- Solo rule ---
+
     #[test]
-    fn infers_when_exactly_one_human() {
+    fn solo_rule_infers_for_single_human() {
         let obs = AudioObservables::new();
         seed_seen(&obs, &[111, 222]);
-        let inferred = obs.infer_solo_speaker(&uid_set(&[42]));
+        let inferred = obs.infer_ssrc_mappings(&uid_set(&[42]));
         assert_eq!(inferred, 2);
         let map = obs.ssrc_map.lock().unwrap();
         assert_eq!(map.get(&111), Some(&42));
@@ -470,15 +511,7 @@ mod infer_solo_tests {
     fn abstains_with_zero_humans() {
         let obs = AudioObservables::new();
         seed_seen(&obs, &[111]);
-        assert_eq!(obs.infer_solo_speaker(&uid_set(&[])), 0);
-        assert!(obs.ssrc_map.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn abstains_with_multiple_humans() {
-        let obs = AudioObservables::new();
-        seed_seen(&obs, &[111]);
-        assert_eq!(obs.infer_solo_speaker(&uid_set(&[1, 2])), 0);
+        assert_eq!(obs.infer_ssrc_mappings(&uid_set(&[])), 0);
         assert!(obs.ssrc_map.lock().unwrap().is_empty());
     }
 
@@ -487,7 +520,7 @@ mod infer_solo_tests {
         let obs = AudioObservables::new();
         obs.ssrc_map.lock().unwrap().insert(111, 999);
         seed_seen(&obs, &[111, 222]);
-        let inferred = obs.infer_solo_speaker(&uid_set(&[42]));
+        let inferred = obs.infer_ssrc_mappings(&uid_set(&[42]));
         assert_eq!(inferred, 1, "only 222 should be inferred — 111 already mapped");
         let map = obs.ssrc_map.lock().unwrap();
         assert_eq!(map.get(&111), Some(&999), "existing mapping wins");
@@ -499,9 +532,61 @@ mod infer_solo_tests {
         let obs = AudioObservables::new();
         seed_seen(&obs, &[111]);
         let humans = uid_set(&[42]);
-        assert_eq!(obs.infer_solo_speaker(&humans), 1);
-        assert_eq!(obs.infer_solo_speaker(&humans), 0, "nothing left to infer");
-        assert_eq!(obs.infer_solo_speaker(&humans), 0);
+        assert_eq!(obs.infer_ssrc_mappings(&humans), 1);
+        assert_eq!(obs.infer_ssrc_mappings(&humans), 0, "nothing left to infer");
+        assert_eq!(obs.infer_ssrc_mappings(&humans), 0);
+    }
+
+    #[test]
+    fn abstains_with_no_unmapped_ssrcs() {
+        let obs = AudioObservables::new();
+        assert_eq!(obs.infer_ssrc_mappings(&uid_set(&[42])), 0);
+    }
+
+    // --- Last-missing-pair rule ---
+
+    #[test]
+    fn last_missing_pair_infers_when_one_of_each_is_unmapped() {
+        // 3 humans, 2 already mapped via OP5, 1 unmapped
+        // 3 seen SSRCs, 2 mapped, 1 unmapped
+        let obs = AudioObservables::new();
+        {
+            let mut m = obs.ssrc_map.lock().unwrap();
+            m.insert(111, 1);
+            m.insert(222, 2);
+        }
+        seed_seen(&obs, &[111, 222, 333]);
+        let inferred = obs.infer_ssrc_mappings(&uid_set(&[1, 2, 3]));
+        assert_eq!(inferred, 1);
+        assert_eq!(obs.ssrc_map.lock().unwrap().get(&333), Some(&3));
+    }
+
+    #[test]
+    fn last_missing_pair_abstains_when_multiple_humans_unmapped() {
+        // 3 humans, only 1 mapped via OP5, 2 unmapped → ambiguous even
+        // if 1 unmapped SSRC, because we don't know which of the 2
+        // unmapped humans it belongs to.
+        let obs = AudioObservables::new();
+        obs.ssrc_map.lock().unwrap().insert(111, 1);
+        seed_seen(&obs, &[111, 222]);
+        let inferred = obs.infer_ssrc_mappings(&uid_set(&[1, 2, 3]));
+        assert_eq!(inferred, 0);
+        assert!(obs.ssrc_map.lock().unwrap().get(&222).is_none());
+    }
+
+    #[test]
+    fn last_missing_pair_abstains_when_multiple_ssrcs_unmapped() {
+        // 3 humans, 2 mapped, 1 unmapped; 4 SSRCs seen, 2 mapped, 2
+        // unmapped → ambiguous (multiple candidates on SSRC side).
+        let obs = AudioObservables::new();
+        {
+            let mut m = obs.ssrc_map.lock().unwrap();
+            m.insert(111, 1);
+            m.insert(222, 2);
+        }
+        seed_seen(&obs, &[111, 222, 333, 444]);
+        let inferred = obs.infer_ssrc_mappings(&uid_set(&[1, 2, 3]));
+        assert_eq!(inferred, 0);
     }
 }
 
