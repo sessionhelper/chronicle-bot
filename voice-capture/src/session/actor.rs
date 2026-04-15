@@ -957,6 +957,10 @@ async fn drive_session(
                 }
             }
             _ = heal_tick.tick() => {
+                // Post-gate inference: catch mid-recording joiners whose
+                // OP5 never landed. Low cadence (5s) is fine — stabilization
+                // is already past, nothing is racing.
+                env.obs.infer_ssrc_mappings(&env.humans_in_channel);
                 let Some(manager) = songbird::get(&env.ctx).await else { continue };
                 let verdict = crate::session::heal::check_and_heal(
                     &manager,
