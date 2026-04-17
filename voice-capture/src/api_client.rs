@@ -836,6 +836,37 @@ impl DataApiClient {
         check_status(resp).await?;
         Ok(())
     }
+
+    // --- Consent tokens ---
+
+    /// Create a consent token for a participant so they can manage
+    /// their consent via a public URL without Discord OAuth.
+    pub async fn create_consent_token(
+        &self,
+        session_id: Uuid,
+        participant_id: Uuid,
+        pseudo_id: &str,
+    ) -> Result<ConsentTokenResponse, ApiError> {
+        let resp = self
+            .client
+            .post(format!("{}/internal/consent-tokens", self.base_url))
+            .header("authorization", self.auth_header().await)
+            .json(&serde_json::json!({
+                "session_id": session_id,
+                "participant_id": participant_id,
+                "pseudo_id": pseudo_id,
+            }))
+            .send()
+            .await?;
+        Ok(check_status(resp).await?.json().await?)
+    }
+}
+
+/// Response from POST /internal/consent-tokens.
+#[derive(Debug, Deserialize)]
+pub struct ConsentTokenResponse {
+    pub token: Uuid,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

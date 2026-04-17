@@ -68,6 +68,13 @@ pub struct Config {
     /// safety is still enforced by the loopback-only port mapping.
     #[arg(long, env = "HARNESS_BIND", default_value = "127.0.0.1")]
     pub harness_bind: std::net::IpAddr,
+
+    /// Portal base URL for consent-token links sent via Discord DM after
+    /// session finalization. When set, the bot creates a consent token per
+    /// participant and DMs each player a link to manage their consent
+    /// without needing Discord OAuth. Unset = skip consent DMs.
+    #[arg(long, env = "PORTAL_URL", default_value = "")]
+    pub portal_url: String,
 }
 
 impl Config {
@@ -99,6 +106,7 @@ mod tests {
             harness_enabled: false,
             harness_port: 8010,
             harness_bind: "127.0.0.1".parse().unwrap(),
+            portal_url: String::new(),
         }
     }
 

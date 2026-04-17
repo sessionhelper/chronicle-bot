@@ -1752,6 +1752,13 @@ async fn finalize_normal(env: &mut ActorEnv, session: &mut Session) {
         post_abandoned_message(&env.ctx, session).await;
     }
 
+    // --- Consent token DMs ---
+    // After successful finalization, create consent tokens and DM each
+    // participant a link to manage their consent without Discord OAuth.
+    if let Some(sid) = session_uuid {
+        send_consent_dms(env, session, sid).await;
+    }
+
     if let Err(e) = buffer::delete_session(&env.buffer_root, &session.id) {
         warn!(error = %e, "buffer_dir_cleanup_failed");
     }
@@ -1855,6 +1862,88 @@ async fn cleanup_consent_embed(ctx: &Context, session: &Session) {
             .http
             .edit_message(channel_id, msg_id, &edit, vec![])
             .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Consent token DMs
+// ---------------------------------------------------------------------------
+
+/// After session finalization, create a consent token per participant and
+/// DM each player a link to manage their consent on the portal without
+/// Discord OAuth. Only fires when `PORTAL_URL` is set in the config.
+async fn send_consent_dms(env: &ActorEnv, session: &Session, session_uuid: uuid::Uuid) {
+    let portal_url = env.state.config.portal_url.trim().to_string();
+    if portal_url.is_empty() {
+        return;
+    }
+    let portal_url = portal_url.trim_end_matches('/');
+
+    let api = env.state.api.clone();
+    let http = env.ctx.http.clone();
+
+    for (_, p) in &session.participants {
+        let participant_uuid = match p.participant_uuid {
+            Some(uuid) => uuid,
+            None => continue, // pre-gate participant, never registered
+        };
+        let pseudo_id = crate::storage::bundle::pseudonymize(p.user_id.get());
+
+        // Create the consent token via data-api.
+        let token = match api
+            .create_consent_token(session_uuid, participant_uuid, &pseudo_id)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    user_id = p.user_id.get(),
+                    error = %e,
+                    "consent_token_create_failed"
+                );
+                continue;
+            }
+        };
+
+        let consent_url = format!("{}/consent/{}", portal_url, token.token);
+
+        // DM the player. Failures are non-fatal (user may have DMs
+        // disabled, bot may lack permissions).
+        let dm_result = async {
+            let dm_channel = p.user_id.create_dm_channel(&http).await?;
+            dm_channel
+                .send_message(
+                    &http,
+                    serenity::all::CreateMessage::new().content(format!(
+                        "Your session recording is ready for review.\n\n\
+                         **Manage your consent, license preferences, or delete your audio:**\n\
+                         {}\n\n\
+                         This link is unique to you — don't share it. It expires in 30 days.",
+                        consent_url,
+                    )),
+                )
+                .await?;
+            Ok::<(), serenity::Error>(())
+        }
+        .await;
+
+        match dm_result {
+            Ok(()) => {
+                info!(
+                    user_id = p.user_id.get(),
+                    display_name = %p.display_name,
+                    "consent_dm_sent"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    user_id = p.user_id.get(),
+                    display_name = %p.display_name,
+                    error = %e,
+                    "consent_dm_failed"
+                );
+            }
+        }
     }
 }
 
