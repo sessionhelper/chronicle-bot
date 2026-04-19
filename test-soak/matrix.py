@@ -82,15 +82,50 @@ def fetch_participants(token: str, session_id: str) -> list[dict]:
         return json.loads(r.read())
 
 
-def consent_all(token: str, session_id: str) -> int:
+CONSENT_POLL_TIMEOUT_SECS = int(os.environ.get("CONSENT_POLL_TIMEOUT_SECS", "120"))
+CONSENT_POLL_INTERVAL_SECS = int(os.environ.get("CONSENT_POLL_INTERVAL_SECS", "3"))
+
+
+def poll_for_participants(
+    token: str, session_id: str, min_expected: int
+) -> list[dict]:
+    """Poll the data-api until at least `min_expected` participants
+    are registered, or the timeout expires. Returns whatever the last
+    fetch saw.
+
+    The bot defers participant registration until audio frames pass the
+    stabilization gate, which is typically ~15-30s after /record. A
+    fixed sleep would either be too short or waste soak time.
+    """
+    deadline = time.time() + CONSENT_POLL_TIMEOUT_SECS
+    participants: list[dict] = []
+    while time.time() < deadline:
+        try:
+            participants = fetch_participants(token, session_id)
+        except Exception as e:
+            print(f"  participant poll error: {e}", file=sys.stderr)
+            participants = []
+        if len(participants) >= min_expected:
+            return participants
+        time.sleep(CONSENT_POLL_INTERVAL_SECS)
+    return participants
+
+
+def consent_all(token: str, session_id: str, min_expected: int = 0) -> int:
     """Mint a consent token per participant and PATCH consent=full.
 
-    Returns the number of participants consented. Skips silently on
-    failure for any one participant — the session assertion will catch
-    non-consented participants downstream.
+    `min_expected` drives the pre-fetch poll: if set, we wait until at
+    least that many participants register (up to CONSENT_POLL_TIMEOUT_SECS)
+    before issuing consent PATCHes. Default 0 polls once for whatever's
+    there — useful for re-consent after a mid-session rejoin.
+
+    Returns the number of participants consented.
     """
     consented = 0
-    participants = fetch_participants(token, session_id)
+    if min_expected > 0:
+        participants = poll_for_participants(token, session_id, min_expected)
+    else:
+        participants = fetch_participants(token, session_id)
     for p in participants:
         try:
             create_req = urllib.request.Request(
@@ -109,7 +144,7 @@ def consent_all(token: str, session_id: str) -> int:
                 consent_token = json.loads(r.read())["token"]
 
             patch_req = urllib.request.Request(
-                f"{DATA_API_URL}/consent/{consent_token}",
+                f"{DATA_API_URL}/public/consent/{consent_token}",
                 data=json.dumps({"consent_scope": "full"}).encode(),
                 headers={"content-type": "application/json"},
                 method="PATCH",
@@ -155,20 +190,30 @@ def run_scenario(scenario_id: str, svc_token: str) -> dict:
     except Exception as e:
         fail("join_failed", str(e))
 
-    # 3. Consent for every participant registered so far
-    # Give data-api a moment to flush post-voice-join participant rows.
-    time.sleep(4)
+    # 3. Fire play FIRST so voice frames stream into the stabilization gate.
+    #    Participants aren't registered in the data-api until the gate opens,
+    #    which needs ~15-30s of continuous frames. Without playback here the
+    #    poll below will time out with no participants.
+    soak.fire_play_on_idle()
+
+    # 4. Poll for participant rows (registered post-stabilization) and
+    #    consent each. Under require_all_consent=true the chunk-upload
+    #    gate stays closed until every participant consents, so this step
+    #    is what lets the rest of the scenario actually produce chunks.
+    expected = len(soak.FEEDER_URLS)
     try:
-        consented = consent_all(svc_token, session_id)
-        print(f"  consented {consented} participants")
+        consented = consent_all(svc_token, session_id, min_expected=expected)
+        print(f"  consented {consented}/{expected} participants")
         if consented == 0:
             fail("consent_zero", "no participants consented; chunks will stay Pending")
+        elif consented < expected:
+            fail(
+                "consent_partial",
+                f"only {consented}/{expected} participants consented",
+            )
     except Exception as e:
         fail("consent_failed", str(e))
         consented = 0
-
-    # 4. Everyone plays
-    soak.fire_play_on_idle()
 
     # 5. Scenario-specific action, interleaved with the wait period
     half = SCENARIO_DURATION_SECS // 2
