@@ -238,11 +238,29 @@ class LogScanResult:
     heal_fired: int = 0
     heal_requested: int = 0
     heal_debounced: int = 0
+    # Absolute counter values from the first + last rollup inside the
+    # scan window. Counters are monotonic since AudioReceiver construction
+    # (which may live longer than one /record session), so deltas are what
+    # describe this soak window specifically.
+    first_rollup_decoded: int | None = None
+    first_rollup_silent: int | None = None
     last_rollup_decoded: int | None = None
     last_rollup_silent: int | None = None
     last_rollup_unmapped: int | None = None
     last_rollup_ssrcs: int | None = None
     rollup_count: int = 0
+
+    @property
+    def decoded_delta(self) -> int | None:
+        if self.first_rollup_decoded is None or self.last_rollup_decoded is None:
+            return None
+        return self.last_rollup_decoded - self.first_rollup_decoded
+
+    @property
+    def silent_delta(self) -> int | None:
+        if self.first_rollup_silent is None or self.last_rollup_silent is None:
+            return None
+        return self.last_rollup_silent - self.first_rollup_silent
 
 
 def scan_bot_logs(started_ms: int) -> LogScanResult:
@@ -278,11 +296,18 @@ def scan_bot_logs(started_ms: int) -> LogScanResult:
             result.heal_debounced += 1
         if "voice_rx_rollup" in line:
             result.rollup_count += 1
-            # Overwrite each iteration so we land on the last rollup.
             decoded = _parse_kv(line, "decoded")
             silent = _parse_kv(line, "silent")
             unmapped = _parse_kv(line, "unmapped")
             ssrcs = _parse_kv(line, "ssrcs_seen")
+            # Record the first rollup in the window as the baseline;
+            # subsequent rollups overwrite `last_*` so we land on the
+            # final state. decoded_delta/silent_delta then describe only
+            # this soak window.
+            if result.first_rollup_decoded is None and decoded is not None:
+                result.first_rollup_decoded = decoded
+            if result.first_rollup_silent is None and silent is not None:
+                result.first_rollup_silent = silent
             if decoded is not None:
                 result.last_rollup_decoded = decoded
             if silent is not None:
@@ -314,14 +339,15 @@ def check_log_signals(state: SoakState, scan: LogScanResult) -> None:
             f"{DAVE_HEAL_REQUEST_LIMIT} "
             f"({scan.heal_debounced} debounced, {scan.heal_fired} fired)",
         )
-    if (
-        scan.last_rollup_silent is not None
-        and scan.last_rollup_silent > SILENT_PACKETS_LIMIT
-    ):
+    # Compare the delta inside the scan window, not the absolute cumulative
+    # counter — AudioReceiver can outlive a single /record session so the
+    # absolute number reflects the bot's lifetime, not this soak.
+    silent_delta = scan.silent_delta
+    if silent_delta is not None and silent_delta > SILENT_PACKETS_LIMIT:
         state.fail(
             "silent_packets",
-            f"final rollup silent={scan.last_rollup_silent} "
-            f"(decoded={scan.last_rollup_decoded}) "
+            f"silent-packet delta {silent_delta} "
+            f"(decoded delta {scan.decoded_delta}) "
             f"> limit {SILENT_PACKETS_LIMIT}",
         )
 

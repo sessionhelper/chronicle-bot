@@ -160,11 +160,27 @@ def consent_all(token: str, session_id: str, min_expected: int = 0) -> int:
     return consented
 
 
-def run_scenario(scenario_id: str, svc_token: str) -> dict:
-    """Execute one scenario end-to-end. Returns a per-scenario report dict."""
+def run_scenario(scenario_id: str) -> dict:
+    """Execute one scenario end-to-end. Returns a per-scenario report dict.
+
+    Mints a fresh service session token per scenario — the data-api
+    expires them after ~90s of no activity, which is shorter than any
+    useful scenario duration.
+    """
     print(f"\n=== scenario {scenario_id} start ===")
     started_ms = soak.now_ms()
     failures: list[dict] = []
+
+    try:
+        svc_token = mint_service_token()
+    except Exception as e:
+        failures.append(
+            {"ts_ms": soak.now_ms(), "kind": "auth_failed", "detail": str(e)}
+        )
+        print(f"FAIL[auth_failed] {e}", file=sys.stderr)
+        return _build_scenario_report(
+            scenario_id, started_ms, None, failures, None, 0
+        )
 
     def fail(kind: str, detail: str) -> None:
         failures.append({"ts_ms": soak.now_ms(), "kind": kind, "detail": detail})
@@ -258,8 +274,10 @@ def run_scenario(scenario_id: str, svc_token: str) -> dict:
             except Exception as e:
                 fail("d1_rejoin_failed", str(e))
         # Re-consent any freshly-registered participant row from the rejoin.
+        # Re-mint the service token first — the initial one is often stale
+        # by this point in D1 (runs late in the scenario).
         try:
-            consent_all(svc_token, session_id)
+            consent_all(mint_service_token(), session_id)
         except Exception as e:
             fail("d1_reconsent_failed", str(e))
         soak.fire_play_on_idle()
@@ -276,7 +294,9 @@ def run_scenario(scenario_id: str, svc_token: str) -> dict:
     except Exception as e:
         fail("stop_failed", str(e))
 
-    # 7. Log scan for this scenario's window.
+    # 7. Log scan for this scenario's window. Use the silent-packet delta
+    #    inside the window rather than the absolute counter, because
+    #    AudioReceiver counters persist across /record sessions.
     time.sleep(6)
     scan = soak.scan_bot_logs(started_ms)
     if scan.scanned:
@@ -285,13 +305,12 @@ def run_scenario(scenario_id: str, svc_token: str) -> dict:
                 "dave_heal_fired",
                 f"{scan.heal_fired} heal(s) during {scenario_id}",
             )
-        if (
-            scan.last_rollup_silent is not None
-            and scan.last_rollup_silent > 0
-        ):
+        silent_delta = scan.silent_delta
+        if silent_delta is not None and silent_delta > 0:
             fail(
                 "silent_packets",
-                f"final rollup silent={scan.last_rollup_silent}",
+                f"silent-packet delta {silent_delta} in {scenario_id} "
+                f"(decoded delta {scan.decoded_delta})",
             )
 
     return _build_scenario_report(
@@ -320,15 +339,15 @@ def _build_scenario_report(
     }
     if scan is not None:
         report["log_scan"] = {
-            k: v for k, v in asdict(scan).items()
+            **{k: v for k, v in asdict(scan).items()},
+            "decoded_delta": scan.decoded_delta,
+            "silent_delta": scan.silent_delta,
         }
     return report
 
 
 def main() -> int:
     print(f"=== matrix start: {MATRIX} ===")
-    svc_token = mint_service_token()
-    print("  minted service token")
 
     results = []
     for sid in MATRIX:
@@ -336,7 +355,7 @@ def main() -> int:
         if not sid:
             continue
         try:
-            results.append(run_scenario(sid, svc_token))
+            results.append(run_scenario(sid))
         except Exception as e:
             results.append(
                 {"scenario": sid, "ok": False, "failures": [{"kind": "crash", "detail": str(e)}]}
